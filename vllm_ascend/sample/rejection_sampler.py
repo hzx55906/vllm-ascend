@@ -65,93 +65,24 @@ class AscendRejectionSampler(RejectionSampler):
     ) -> torch.Tensor:
         if sampling_metadata.no_penalties:
             return logits
-        # return logits 
-        # Get tensor parallel info
-        # tp_group = get_tp_group()
-        # tp_rank = tp_group.rank_in_group
-        # local_vocab_size = logits.shape[-1]
+        # return logits
+        """Use Triton-Ascend penalties on NPU when Triton is available; else vLLM default."""
+        if not HAS_TRITON:
+            return Sampler.apply_penalties(logits, sampling_metadata, output_token_ids)
 
-        # # Calculate the global token ID range for current rank
-        # start_token_id = tp_rank * local_vocab_size
-        # end_token_id = start_token_id + local_vocab_size
-
-        # # Convert global token IDs to local token IDs for current rank
-        # # Only keep tokens that belong to current rank's partition
-        # local_output_token_ids = []
-        # for token_ids in output_token_ids:
-        #     local_ids = []
-        #     for tid in token_ids:
-        #         if start_token_id <= tid < end_token_id:
-        #             # Convert to local index
-        #             local_ids.append(tid - start_token_id)
-        #         elif tid >= 0:  # Valid token but not in current partition
-        #             # Use -1 as placeholder (will be ignored in penalty application)
-        #             local_ids.append(-1)
-        #         else:
-        #             local_ids.append(tid)
-        #     local_output_token_ids.append(local_ids)
-
-        # Apply penalties using local token IDs
         assert sampling_metadata.prompt_token_ids is not None
-        
         prompt_token_ids = sampling_metadata.prompt_token_ids[repeat_indices]
         presence_penalties = sampling_metadata.presence_penalties[repeat_indices]
         frequency_penalties = sampling_metadata.frequency_penalties[repeat_indices]
         repetition_penalties = sampling_metadata.repetition_penalties[repeat_indices]
-        # print("repeat_indices", repeat_indices.shape, repeat_indices)
-        # print("prompt_token_ids0", sampling_metadata.prompt_token_ids.shape, sampling_metadata.prompt_token_ids)
-        # print("presence_penalties0", sampling_metadata.presence_penalties.shape, sampling_metadata.presence_penalties)
-        # print("frequency_penalties0", sampling_metadata.frequency_penalties.shape, sampling_metadata.frequency_penalties)
-        # print("repetition_penalties0", sampling_metadata.repetition_penalties.shape, sampling_metadata.repetition_penalties)
-        # print("prompt_token_ids", prompt_token_ids.shape, prompt_token_ids)
-        # print("presence_penalties", presence_penalties.shape, presence_penalties)
-        # print("frequency_penalties", frequency_penalties.shape, frequency_penalties)
-        # print("repetition_penalties", repetition_penalties.shape,repetition_penalties)
-        if HAS_TRITON:
-            processed_logits = apply_all_penalties(
-                logits,
-                prompt_token_ids,
-                presence_penalties,
-                frequency_penalties,
-                repetition_penalties,
-                output_token_ids,
-            )
-        else:
-            processed_logits = Sampler.apply_penalties(
-                logits, sampling_metadata, output_token_ids
-            )
-
-        return processed_logits
-    
-    # @staticmethod
-    # def apply_penalties(
-    #     logits: torch.Tensor,
-    #     sampling_metadata: SamplingMetadata,
-    #     metadata: SpecDecodeMetadata,
-    #     repeat_indices: torch.Tensor,
-    #     output_token_ids: list[list[int]],
-    # ) -> torch.Tensor:
-    #     # return logits
-    #     logits = tensor_model_parallel_all_gather(logits, -1)
-    #     """Use Triton-Ascend penalties on NPU when Triton is available; else vLLM default."""
-    #     if not HAS_TRITON:
-    #         return Sampler.apply_penalties(logits, sampling_metadata, output_token_ids)
-
-    #     if sampling_metadata.no_penalties:
-    #         return logits
-    #     assert sampling_metadata.prompt_token_ids is not None
-    #     prompt_token_ids = sampling_metadata.prompt_token_ids[repeat_indices]
-    #     presence_penalties = sampling_metadata.presence_penalties[repeat_indices]
-    #     frequency_penalties = sampling_metadata.frequency_penalties[repeat_indices]
-    #     repetition_penalties = sampling_metadata.repetition_penalties[repeat_indices]
-    #     return apply_all_penalties(
-    #         logits,
-    #         prompt_token_ids,
-    #         presence_penalties,
-    #         frequency_penalties,
-    #         repetition_penalties,
-    #         output_token_ids,
-    #     )
+        return apply_all_penalties(
+            logits,
+            prompt_token_ids,
+            presence_penalties,
+            frequency_penalties,
+            repetition_penalties,
+            output_token_ids,
+        )
         
     def __init__(self, sampler):
         super().__init__(sampler)

@@ -28,10 +28,10 @@ from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 
 import triton
 import triton.language as tl
-# from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.distributed import get_tensor_model_parallel_rank
 
 @triton.jit
-def token_bin_counts_and_mask_kernel1(
+def token_bin_counts_and_mask_kernel(
     tokens_ptr,
     tokens_batch_stride,
     tokens_seq_stride,
@@ -39,6 +39,7 @@ def token_bin_counts_and_mask_kernel1(
     seq_len,
     vocab_size,
     bin_counts_ptr,
+    tp_rank,
     counts_batch_stride,
     counts_vocab_stride,
     SEQ_BLOCK: tl.constexpr,
@@ -59,8 +60,6 @@ def token_bin_counts_and_mask_kernel1(
     pid1 = tl.program_id(axis=1)
     progs = tl.num_programs(axis=0)
 
-    tp_group = get_tp_group()
-    tp_rank = tp_group.rank_in_group
     vocab_start_idx = tp_rank * vocab_size
     
     n_seq_blocks = tl.cdiv(seq_len, SEQ_BLOCK)
@@ -95,60 +94,60 @@ def token_bin_counts_and_mask_kernel1(
     count_ptr = batch_counts_start + local_token * counts_vocab_stride
     tl.atomic_add(count_ptr, 1, mask=token_in_range)
     
-@triton.jit
-def token_bin_counts_and_mask_kernel(
-    tokens_ptr,
-    tokens_batch_stride,
-    tokens_seq_stride,
-    batch_size,
-    seq_len,
-    vocab_size,
-    bin_counts_ptr,
-    counts_batch_stride,
-    counts_vocab_stride,
-    SEQ_BLOCK: tl.constexpr,
-):
-    """Count token occurrences per batch row.
+# @triton.jit
+# def token_bin_counts_and_mask_kernel(
+#     tokens_ptr,
+#     tokens_batch_stride,
+#     tokens_seq_stride,
+#     batch_size,
+#     seq_len,
+#     vocab_size,
+#     bin_counts_ptr,
+#     counts_batch_stride,
+#     counts_vocab_stride,
+#     SEQ_BLOCK: tl.constexpr,
+# ):
+#     """Count token occurrences per batch row.
 
-    2D tiling:
-      - axis=0: core/program group dimension
-      - axis=1: block id dimension
+#     2D tiling:
+#       - axis=0: core/program group dimension
+#       - axis=1: block id dimension
 
-    We linearize (batch_idx, seq_block_id) into a single global block id and
-    distribute blocks across all programs to improve utilization when
-    batch_size is small but seq_len is large (typical prefill).
+#     We linearize (batch_idx, seq_block_id) into a single global block id and
+#     distribute blocks across all programs to improve utilization when
+#     batch_size is small but seq_len is large (typical prefill).
 
-    Tokens with value >= vocab_size (e.g. padding) are skipped.
-    """
-    pid0 = tl.program_id(axis=0)
-    pid1 = tl.program_id(axis=1)
-    progs = tl.num_programs(axis=0)
+#     Tokens with value >= vocab_size (e.g. padding) are skipped.
+#     """
+#     pid0 = tl.program_id(axis=0)
+#     pid1 = tl.program_id(axis=1)
+#     progs = tl.num_programs(axis=0)
 
-    n_seq_blocks = tl.cdiv(seq_len, SEQ_BLOCK)
-    linear_block = pid1 * progs + pid0
-    total_blocks = batch_size * n_seq_blocks
-    if linear_block >= total_blocks:
-        return
+#     n_seq_blocks = tl.cdiv(seq_len, SEQ_BLOCK)
+#     linear_block = pid1 * progs + pid0
+#     total_blocks = batch_size * n_seq_blocks
+#     if linear_block >= total_blocks:
+#         return
 
-    batch_idx = linear_block // n_seq_blocks
-    seq_block_id = linear_block - batch_idx * n_seq_blocks
-    seq_start = seq_block_id * SEQ_BLOCK
+#     batch_idx = linear_block // n_seq_blocks
+#     seq_block_id = linear_block - batch_idx * n_seq_blocks
+#     seq_start = seq_block_id * SEQ_BLOCK
 
-    batch_tokens_start = tokens_ptr + batch_idx * tokens_batch_stride
-    batch_counts_start = bin_counts_ptr + batch_idx * counts_batch_stride
+#     batch_tokens_start = tokens_ptr + batch_idx * tokens_batch_stride
+#     batch_counts_start = bin_counts_ptr + batch_idx * counts_batch_stride
 
-    pos_offsets = seq_start + tl.arange(0, SEQ_BLOCK)
-    pos_mask = pos_offsets < seq_len
-    token = tl.load(
-        batch_tokens_start + pos_offsets * tokens_seq_stride,
-        mask=pos_mask,
-        other=vocab_size,  # force invalid
-    )
-    # Only count valid token ids in [0, vocab_size). Padding must use id >= vocab_size
-    # (see vLLM apply_penalties contract); those positions are masked out here.
-    token_in_range = (token >= 0) & (token < vocab_size) & pos_mask
-    count_ptr = batch_counts_start + token * counts_vocab_stride
-    tl.atomic_add(count_ptr, 1, mask=token_in_range)
+#     pos_offsets = seq_start + tl.arange(0, SEQ_BLOCK)
+#     pos_mask = pos_offsets < seq_len
+#     token = tl.load(
+#         batch_tokens_start + pos_offsets * tokens_seq_stride,
+#         mask=pos_mask,
+#         other=vocab_size,  # force invalid
+#     )
+#     # Only count valid token ids in [0, vocab_size). Padding must use id >= vocab_size
+#     # (see vLLM apply_penalties contract); those positions are masked out here.
+#     token_in_range = (token >= 0) & (token < vocab_size) & pos_mask
+#     count_ptr = batch_counts_start + token * counts_vocab_stride
+#     tl.atomic_add(count_ptr, 1, mask=token_in_range)
 
 
 def get_token_bin_counts_and_mask_triton(
@@ -192,7 +191,10 @@ def get_token_bin_counts_and_mask_triton(
     total_blocks = n_rows * n_seq_blocks
     progs = min(core_num, total_blocks)
     grid = (progs, triton.cdiv(total_blocks, progs))
-
+    
+    tp_group = get_tp_group()
+    tp_rank = tp_group.rank_in_group
+    
     token_bin_counts_and_mask_kernel[grid](
         tokens,
         tokens.stride(0),
@@ -201,6 +203,7 @@ def get_token_bin_counts_and_mask_triton(
         n_cols,
         vocab_size,
         bin_counts,
+        tp_rank,
         bin_counts.stride(0),
         bin_counts.stride(1),
         SEQ_BLOCK=SEQ_BLOCK,

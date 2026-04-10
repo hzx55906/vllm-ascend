@@ -22,10 +22,79 @@
 
 import torch
 from vllm.triton_utils import tl, triton
+from vllm.distributed.parallel_state import get_tp_group
 
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 
+import triton
+import triton.language as tl
+# from vllm.distributed import get_tensor_model_parallel_rank
 
+@triton.jit
+def token_bin_counts_and_mask_kernel1(
+    tokens_ptr,
+    tokens_batch_stride,
+    tokens_seq_stride,
+    batch_size,
+    seq_len,
+    vocab_size,
+    bin_counts_ptr,
+    counts_batch_stride,
+    counts_vocab_stride,
+    SEQ_BLOCK: tl.constexpr,
+):
+    """Count token occurrences per batch row.
+
+    2D tiling:
+      - axis=0: core/program group dimension
+      - axis=1: block id dimension
+
+    We linearize (batch_idx, seq_block_id) into a single global block id and
+    distribute blocks across all programs to improve utilization when
+    batch_size is small but seq_len is large (typical prefill).
+
+    Tokens with value >= vocab_size (e.g. padding) are skipped.
+    """
+    pid0 = tl.program_id(axis=0)
+    pid1 = tl.program_id(axis=1)
+    progs = tl.num_programs(axis=0)
+
+    tp_group = get_tp_group()
+    tp_rank = tp_group.rank_in_group
+    vocab_start_idx = tp_rank * vocab_size
+    
+    n_seq_blocks = tl.cdiv(seq_len, SEQ_BLOCK)
+    linear_block = pid1 * progs + pid0
+    total_blocks = batch_size * n_seq_blocks
+    if linear_block >= total_blocks:
+        return
+
+    batch_idx = linear_block // n_seq_blocks
+    seq_block_id = linear_block - batch_idx * n_seq_blocks
+    seq_start = seq_block_id * SEQ_BLOCK
+
+    batch_tokens_start = tokens_ptr + batch_idx * tokens_batch_stride
+    batch_counts_start = bin_counts_ptr + batch_idx * counts_batch_stride
+
+    pos_offsets = seq_start + tl.arange(0, SEQ_BLOCK)
+    pos_mask = pos_offsets < seq_len
+    token = tl.load(
+        batch_tokens_start + pos_offsets * tokens_seq_stride,
+        mask=pos_mask,
+        other=vocab_size + vocab_start_idx,
+    )
+
+    local_token = token - vocab_start_idx
+
+    token_in_range = (
+        pos_mask
+        & (token >= vocab_start_idx)
+        & (local_token < vocab_size)
+    )
+
+    count_ptr = batch_counts_start + local_token * counts_vocab_stride
+    tl.atomic_add(count_ptr, 1, mask=token_in_range)
+    
 @triton.jit
 def token_bin_counts_and_mask_kernel(
     tokens_ptr,

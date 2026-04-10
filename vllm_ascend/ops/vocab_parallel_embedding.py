@@ -271,7 +271,7 @@ class AscendLogitsProcessor(LogitsProcessor):
             logits = logits[..., : self.org_vocab_size]
         return logits
 
-    def _get_logits_normal(
+    def _get_logits_normal1(
         self,
         hidden_states: torch.Tensor,
         lm_head: AscendParallelLMHead,
@@ -286,3 +286,22 @@ class AscendLogitsProcessor(LogitsProcessor):
             logits = logits[..., : self.org_vocab_size]
 
         return logits
+
+    def _get_logits_normal(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: AscendParallelLMHead,
+        embedding_bias: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        local_logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
+        # Gather logits for tensor parallel
+        # logits = self._gather_logits(local_logits)
+
+        # # Remove paddings in vocab (if any)
+        # if logits is not None:
+        #     logits = logits[..., : self.org_vocab_size // self.tp_size]
+
+        if local_logits is not None:
+            local_logits = local_logits[..., : self.org_vocab_size // get_tp_group().world_size]
+        # return logits
+        return local_logits

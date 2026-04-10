@@ -123,7 +123,8 @@ class NPUWorker(WorkerBase):
 
         # Profiler is lazily initialized on first profile(is_start=True) call (RFC #6954)
         self.profiler_config = vllm_config.profiler_config
-        self.profiler = None
+        # self.profiler = None
+        self.profiler = self._create_profiler()
         if vllm_config.model_config and vllm_config.model_config.enable_sleep_mode:
             # Buffers saved before sleep
             self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
@@ -374,6 +375,13 @@ class NPUWorker(WorkerBase):
             self._pp_send_work = []
 
         intermediate_tensors = None
+        if envs_vllm.VLLM_TORCH_PROFILER_DIR:
+            if not self.profile_already_start:
+                # self.profiler.start()
+                self.profile_already_start = True
+                self.profile_step = 0
+            if self.profile_already_start and self.profile_step + 10 == self.profiler_stop_step:
+                self.profiler.start()
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass and not get_pp_group().is_first_rank:
             # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise
@@ -393,6 +401,16 @@ class NPUWorker(WorkerBase):
             )
 
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+        if envs_vllm.VLLM_TORCH_PROFILER_DIR:
+            if self.profile_already_start and not self.profile_finished:
+                self.profile_step += 1
+                # self.profiler.stop()
+                # self.profile_finished = True
+                # print("profile_finished")
+            if not self.profile_finished and self.profile_step >= self.profiler_stop_step:
+                self.profiler.stop()
+                self.profile_finished = True
+                # print("profile_finished1")
         if isinstance(output, (ModelRunnerOutput, AsyncModelRunnerOutput, NoneType)):
             return output
 
@@ -541,7 +559,8 @@ class NPUWorker(WorkerBase):
             trace_name = f"{profile_prefix}_{rank_suffix}" if profile_prefix else rank_suffix
 
             if self.profiler is None:
-                self.profiler = self._create_profiler(trace_name)
+                # self.profiler = self._create_profiler(trace_name)
+                self.profiler = self._create_profiler()
                 logger.debug("Starting torch profiler with trace name: %s", trace_name)
                 self.profiler.start()  # type: ignore[attr-defined]
             else:
@@ -587,16 +606,17 @@ class NPUWorker(WorkerBase):
         init_ascend_model_parallel(self.parallel_config)
         ensure_ec_transfer_initialized(self.vllm_config)
 
-    def _create_profiler(self, trace_name: str):
+    def _create_profiler(self):
+    # def _create_profiler(self, trace_name: str):
         """Create torch_npu profiler with trace naming for unique files per worker (RFC #6954)."""
         profiler_config = self.profiler_config
 
-        if profiler_config.profiler != "torch":
-            raise RuntimeError(f"Unrecognized profiler: {profiler_config.profiler}")
-        if not profiler_config.torch_profiler_dir:
-            raise RuntimeError("torch_profiler_dir cannot be empty.")
-        if envs_ascend.MSMONITOR_USE_DAEMON:
-            raise RuntimeError("MSMONITOR_USE_DAEMON and torch profiler cannot be both enabled at the same time.")
+        # if profiler_config.profiler != "torch":
+        #     raise RuntimeError(f"Unrecognized profiler: {profiler_config.profiler}")
+        # if not profiler_config.torch_profiler_dir:
+        #     raise RuntimeError("torch_profiler_dir cannot be empty.")
+        # if envs_ascend.MSMONITOR_USE_DAEMON:
+        #     raise RuntimeError("MSMONITOR_USE_DAEMON and torch profiler cannot be both enabled at the same time.")
 
         experimental_config = torch_npu.profiler._ExperimentalConfig(
             export_type=torch_npu.profiler.ExportType.Text,
@@ -609,6 +629,17 @@ class NPUWorker(WorkerBase):
             record_op_args=False,
             gc_detect_threshold=None,
         )
+
+        # return None
+        
+        envs_vllm.VLLM_TORCH_PROFILER_DIR = True
+        profiler_config.torch_profiler_dir = "/home/w00954347/prof/0408"
+        profiler_config.torch_profiler_with_stack = False
+        profiler_config.torch_profiler_with_memory = False
+        self.profile_already_start = False
+        # self.profile_step = 0
+        self.profile_finished = False
+        self.profiler_stop_step = 50 #int(os.environ.get('PROFILER_STOP_STEP',"500"))
 
         return torch_npu.profiler.profile(
             activities=[
@@ -623,7 +654,7 @@ class NPUWorker(WorkerBase):
             experimental_config=experimental_config,
             on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
                 profiler_config.torch_profiler_dir,
-                worker_name=trace_name,
+                # worker_name=trace_name,
             ),
         )
 

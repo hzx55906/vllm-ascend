@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import replace
+
 import torch
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -7,9 +9,15 @@ from vllm.v1.sample.rejection_sampler import (
     GREEDY_TEMPERATURE,
     MAX_SPEC_LEN,
     PLACEHOLDER_TOKEN_ID,
+    RejectionSampler,
     generate_uniform_probs,
 )
-
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_gather,
+)
+from vllm.distributed.parallel_state import get_tp_group
 from vllm_ascend.ops.triton.reject_sample import (
     cal_grid_and_block_size,
     expand_triton,
@@ -18,34 +26,297 @@ from vllm_ascend.ops.triton.reject_sample import (
     rejection_random_sample_kernel,
     sample_recovered_tokens_kernel,
 )
+from vllm_ascend.sample.penalties import apply_all_penalties
 from vllm_ascend.sample.sampler import apply_top_k_top_p
+from vllm_ascend.sample.rejection_sampler_compressed import (
+    sample_recovered_tokens_compressed,
+    rejection_random_sample_compressed_pytorch,
+    rejection_random_sample_block_verify_compressed_pytorch,
+)
 
+from vllm.logger import init_logger
+from vllm.triton_utils import tl, triton
+from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
+from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
+# from vllm.v1.sample.ops.penalties import apply_all_penalties
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+from vllm.v1.sample.sampler import Sampler
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
+class AscendRejectionSampler(RejectionSampler):
+    """Ascend-optimized rejection sampler for speculative decoding.
+
+    This class overrides key methods from the base RejectionSampler to provide
+    Ascend-specific optimizations:
+    - Optimized greedy sampling with reduced communication
+    - Distributed top-k/top-p sampling
+    - Efficient batch expansion operations
+    """
+    
+    @staticmethod
+    def apply_penalties(
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        metadata: SpecDecodeMetadata,
+        repeat_indices: torch.Tensor,
+        output_token_ids: list[list[int]],
+    ) -> torch.Tensor:
+        if sampling_metadata.no_penalties:
+            return logits
+        # return logits 
+        # Get tensor parallel info
+        # tp_group = get_tp_group()
+        # tp_rank = tp_group.rank_in_group
+        # local_vocab_size = logits.shape[-1]
+
+        # # Calculate the global token ID range for current rank
+        # start_token_id = tp_rank * local_vocab_size
+        # end_token_id = start_token_id + local_vocab_size
+
+        # # Convert global token IDs to local token IDs for current rank
+        # # Only keep tokens that belong to current rank's partition
+        # local_output_token_ids = []
+        # for token_ids in output_token_ids:
+        #     local_ids = []
+        #     for tid in token_ids:
+        #         if start_token_id <= tid < end_token_id:
+        #             # Convert to local index
+        #             local_ids.append(tid - start_token_id)
+        #         elif tid >= 0:  # Valid token but not in current partition
+        #             # Use -1 as placeholder (will be ignored in penalty application)
+        #             local_ids.append(-1)
+        #         else:
+        #             local_ids.append(tid)
+        #     local_output_token_ids.append(local_ids)
+
+        # Apply penalties using local token IDs
+        assert sampling_metadata.prompt_token_ids is not None
+        
+        prompt_token_ids = sampling_metadata.prompt_token_ids[repeat_indices]
+        presence_penalties = sampling_metadata.presence_penalties[repeat_indices]
+        frequency_penalties = sampling_metadata.frequency_penalties[repeat_indices]
+        repetition_penalties = sampling_metadata.repetition_penalties[repeat_indices]
+        # print("repeat_indices", repeat_indices.shape, repeat_indices)
+        # print("prompt_token_ids0", sampling_metadata.prompt_token_ids.shape, sampling_metadata.prompt_token_ids)
+        # print("presence_penalties0", sampling_metadata.presence_penalties.shape, sampling_metadata.presence_penalties)
+        # print("frequency_penalties0", sampling_metadata.frequency_penalties.shape, sampling_metadata.frequency_penalties)
+        # print("repetition_penalties0", sampling_metadata.repetition_penalties.shape, sampling_metadata.repetition_penalties)
+        # print("prompt_token_ids", prompt_token_ids.shape, prompt_token_ids)
+        # print("presence_penalties", presence_penalties.shape, presence_penalties)
+        # print("frequency_penalties", frequency_penalties.shape, frequency_penalties)
+        # print("repetition_penalties", repetition_penalties.shape,repetition_penalties)
+        if HAS_TRITON:
+            processed_logits = apply_all_penalties(
+                logits,
+                prompt_token_ids,
+                presence_penalties,
+                frequency_penalties,
+                repetition_penalties,
+                output_token_ids,
+            )
+        else:
+            processed_logits = Sampler.apply_penalties(
+                logits, sampling_metadata, output_token_ids
+            )
+
+        return processed_logits
+    
+    # @staticmethod
+    # def apply_penalties(
+    #     logits: torch.Tensor,
+    #     sampling_metadata: SamplingMetadata,
+    #     metadata: SpecDecodeMetadata,
+    #     repeat_indices: torch.Tensor,
+    #     output_token_ids: list[list[int]],
+    # ) -> torch.Tensor:
+    #     # return logits
+    #     logits = tensor_model_parallel_all_gather(logits, -1)
+    #     """Use Triton-Ascend penalties on NPU when Triton is available; else vLLM default."""
+    #     if not HAS_TRITON:
+    #         return Sampler.apply_penalties(logits, sampling_metadata, output_token_ids)
+
+    #     if sampling_metadata.no_penalties:
+    #         return logits
+    #     assert sampling_metadata.prompt_token_ids is not None
+    #     prompt_token_ids = sampling_metadata.prompt_token_ids[repeat_indices]
+    #     presence_penalties = sampling_metadata.presence_penalties[repeat_indices]
+    #     frequency_penalties = sampling_metadata.frequency_penalties[repeat_indices]
+    #     repetition_penalties = sampling_metadata.repetition_penalties[repeat_indices]
+    #     return apply_all_penalties(
+    #         logits,
+    #         prompt_token_ids,
+    #         presence_penalties,
+    #         frequency_penalties,
+    #         repetition_penalties,
+    #         output_token_ids,
+    #     )
+        
+    def __init__(self, sampler):
+        super().__init__(sampler)
+        # Store Ascend-specific optimizations
+        self._ascend_optimizations_enabled = True
+    
+    def forward(
+        self,
+        metadata: SpecDecodeMetadata,
+        # [num_tokens, vocab_size]
+        draft_probs: torch.Tensor | None,
+        # [num_tokens + batch_size, vocab_size]
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> SamplerOutput:
+        """
+        Args:
+            metadata:
+                Metadata for spec decoding.
+            draft_probs (Optional[torch.Tensor]):
+                Probability distribution for the draft tokens. Shape is
+                [num_tokens, vocab_size]. Can be None if probabilities are
+                not provided, which is the case for ngram spec decode.
+            logits (torch.Tensor):
+                Target model's logits probability distribution.
+                Shape is [num_tokens + batch_size, vocab_size]. Here,
+                probabilities from different requests are flattened into a
+                single tensor because this is the shape of the output logits.
+                NOTE: `logits` can be updated in place to save memory.
+            sampling_metadata (vllm.v1.sample.metadata.SamplingMetadata):
+                Additional metadata needed for sampling, such as temperature,
+                top-k/top-p parameters, or other relevant information.
+        Returns:
+            SamplerOutput:
+                Contains the final output token IDs and their logprobs if
+                requested.
+        """
+        assert metadata.max_spec_len <= MAX_SPEC_LEN
+
+        bonus_logits_indices = metadata.bonus_logits_indices
+        target_logits_indices = metadata.target_logits_indices
+
+        # When indexing with a tensor (bonus_logits_indices), PyTorch
+        # creates a new tensor with separate storage from the original
+        # logits tensor. This means any in-place operations on bonus_logits
+        # won't affect the original logits tensor.
+        assert logits is not None
+        bonus_logits = logits[bonus_logits_indices]
+        bonus_sampler_output = self.sampler(
+            logits=bonus_logits,
+            sampling_metadata=replace(
+                sampling_metadata,
+                max_num_logprobs=-1,
+            ),
+            predict_bonus_token=True,
+            # Override the logprobs mode to return logits because they are
+            # needed later to compute the accepted token logprobs.
+            logprobs_mode_override="processed_logits"
+            if self.is_processed_logprobs_mode
+            else "raw_logits",
+        )
+        bonus_token_ids = bonus_sampler_output.sampled_token_ids
+
+        # Just like `bonus_logits`, `target_logits` is a new tensor with
+        # separate storage from the original `logits` tensor. Therefore,
+        # it is safe to update `target_logits` in place.
+        raw_target_logits = logits[target_logits_indices]
+        # Use float32 for the target_logits.
+        raw_target_logits = raw_target_logits.to(torch.float32)
+        target_logits = raw_target_logits
+        if not self.is_processed_logprobs_mode:
+            # Clone raw_target_logits before applying processors to preserve
+            # the original raw logits for logprobs computation, since
+            # apply_logits_processors modifies the tensor in-place.
+            target_logits = target_logits.clone()
+        target_logits = self.apply_logits_processors(
+            target_logits, sampling_metadata, metadata
+        )
+        # [num_tokens, vocab_size]
+        # NOTE(woosuk): `target_logits` can be updated in place inside the
+        # `apply_sampling_constraints` function.
+        target_logits = apply_sampling_constraints(
+            target_logits,
+            metadata.cu_num_draft_tokens,
+            sampling_metadata,
+        )
+
+        output_token_ids = rejection_sample(
+            metadata.draft_token_ids,
+            metadata.num_draft_tokens,
+            metadata.max_spec_len,
+            metadata.cu_num_draft_tokens,
+            draft_probs,
+            target_logits,
+            bonus_token_ids,
+            sampling_metadata,
+        )
+
+        logprobs_tensors = None
+        if sampling_metadata.max_num_logprobs is not None:
+            logprobs_tensors = self._get_logprobs_tensors(
+                sampling_metadata.max_num_logprobs,
+                metadata,
+                logits,
+                target_logits if self.is_processed_logprobs_mode else raw_target_logits,
+                bonus_sampler_output.logprobs_tensors.logprobs,
+                output_token_ids,
+            )
+
+        return SamplerOutput(
+            sampled_token_ids=output_token_ids,
+            logprobs_tensors=logprobs_tensors,
+        )
+
+def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
+    tp_group = get_tp_group()
+    B, V_local = logits.shape
+    rank = tp_group.rank_in_group
+    world_size = tp_group.world_size
+
+    local_max_logits, local_max_indices = logits.max(dim=-1)
+
+    local_global_idx = local_max_indices + rank * V_local  # [B]
+
+    # [B, world_size]
+    gathered_logits = tp_group.all_gather(local_max_logits, dim=-1).view(B, world_size)
+
+    gathered_global_idx = tp_group.all_gather(local_global_idx, dim=-1).view(B, world_size)  # [B, world_size]
+
+    global_max_rank = gathered_logits.argmax(dim=-1)  # [B]
+
+    target_argmax = gathered_global_idx.gather(
+        dim=-1,
+        index=global_max_rank.unsqueeze(-1)
+    ).squeeze(-1)  # [B]
+    return target_argmax
+    
 def apply_sampling_constraints(
-    logits: torch.Tensor,  # [num_tokens, vocab_size]
+    logits: torch.Tensor,  # [num_tokens, vocab_size//tp_size]
     cu_num_draft_tokens: torch.Tensor,  # [batch_size]
     sampling_metadata: SamplingMetadata,
-) -> torch.Tensor:
-    """Process logits based on sampling metadata.
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Process logits based on sampling metadata for distributed scenario.
 
     This function applies temperature scaling to the logits,
-    as well as top-k and top-p. For greedy decoding, it returns
+    then top-k, allgather, and top-p. For greedy decoding, it returns
     the original logits.
 
     Args:
-        logits: Input logits tensor to be processed.
+        logits: Input logits tensor to be processed (local vocab partition).
         cu_num_draft_tokens: Cumulative number of draft tokens.
         sampling_metadata: Metadata containing sampling parameters such as
             temperature and whether greedy sampling is used.
 
     Returns:
-        torch.Tensor: Processed logits if non-greedy sampling is used,
-        otherwise returns the original logits.
+        tuple[torch.Tensor, torch.Tensor | None]:
+            - Processed logits of shape [num_tokens, top_k*tp_size] or
+                [num_tokens, vocab_size//tp_size] for greedy
+            - Indices tensor of shape [num_tokens, top_k*tp_size] or None for greedy
     """
     assert logits.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
     if sampling_metadata.all_greedy:
-        return logits
+        # return logits
+        return logits, None
 
     num_tokens = logits.shape[0]
     temperature = expand_batch_to_tokens(
@@ -74,10 +345,9 @@ def apply_sampling_constraints(
             num_tokens,
         )
 
-    # NOTE(woosuk): `apply_top_k_top_p` uses sorting to calculate the mask,
-    # which is slow for large vocab sizes. This may cause performance issues.
-    return apply_top_k_top_p(logits, top_k, top_p)
-
+    # New flow: top_k -> allgather -> top_p
+    # Returns processed logits and indices
+    return apply_top_k_top_p(logits, 20, top_k, top_p)
 
 def rejection_sample(
     # [num_tokens]
@@ -89,12 +359,41 @@ def rejection_sample(
     cu_num_draft_tokens: torch.Tensor,
     # [num_tokens, vocab_size]
     draft_probs: torch.Tensor | None,
-    # [num_tokens, vocab_size]
-    target_logits: torch.Tensor,
+    # [num_tokens, vocab_size//tp_size] or tuple of (logits, indices)
+    # For greedy: Tensor [num_tokens, vocab_size//tp_size]
+    # For random: tuple of (logits [num_tokens, top_k*tp_size], indices [num_tokens, top_k*tp_size])
+    target_logits_or_tuple: torch.Tensor | tuple[torch.Tensor, torch.Tensor | None],
     # [batch_size, 1]
     bonus_token_ids: torch.Tensor,
     sampling_metadata: SamplingMetadata,
 ) -> torch.Tensor:
+    """
+    Rejection sampling for speculative decoding in distributed setting.
+
+    Args:
+        draft_token_ids: Draft token IDs [num_tokens]
+        num_draft_tokens: Number of draft tokens per request
+        max_spec_len: Maximum speculative length
+        cu_num_draft_tokens: Cumulative draft tokens [batch_size]
+        draft_probs: Draft probabilities [num_tokens, vocab_size] or None for ngram
+        target_logits_or_tuple: Target logits or tuple of (logits, indices)
+            - For greedy: Tensor [num_tokens, vocab_size//tp_size]
+            - For random: tuple of (compressed_logits, indices) where
+                - compressed_logits: [num_tokens, top_k*tp_size]
+                - indices: [num_tokens, top_k*tp_size] global vocabulary indices or None
+        bonus_token_ids: Bonus token IDs [batch_size, 1]
+        sampling_metadata: Sampling metadata
+
+    Returns:
+        output_token_ids: [batch_size, max_spec_len + 1]
+    """
+    # Unpack target_logits_or_tuple
+    if isinstance(target_logits_or_tuple, tuple):
+        target_logits, target_indices = target_logits_or_tuple
+    else:
+        target_logits = target_logits_or_tuple
+        target_indices = None
+
     assert draft_token_ids.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
@@ -102,13 +401,12 @@ def rejection_sample(
 
     batch_size = len(num_draft_tokens)
     num_tokens = draft_token_ids.shape[0]
-    vocab_size = target_logits.shape[-1]
     device = target_logits.device
     assert draft_token_ids.is_contiguous()
     assert draft_probs is None or draft_probs.is_contiguous()
     assert target_logits.is_contiguous()
     assert bonus_token_ids.is_contiguous()
-    assert target_logits.shape == (num_tokens, vocab_size)
+    assert target_logits.shape[0] == num_tokens
 
     # When num_speculative_tokens>=3, using block verify.
     # Skip block verify when draft_probs is None (suffix/ngram methods)
@@ -129,9 +427,37 @@ def rejection_sample(
         is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE
     if HAS_TRITON:
         grid, block_size = cal_grid_and_block_size(batch_size)
+
+    # For greedy sampling, we need to do allgather first to get global argmax
     if not sampling_metadata.all_random:
-        # Rejection sampling for greedy sampling requests.
-        target_argmax = target_logits.argmax(dim=-1)
+        # Optimized greedy: local argmax -> allgather -> global argmax
+        # This reduces communication from vocab_size to 2 (token_id + logit_value) per token
+        target_argmax = greedy_sample(target_logits)
+        # target_logits = tensor_model_parallel_all_gather(target_logits, -1)
+        # target_argmax = target_logits.argmax(dim=-1)
+        # Step 1: Local argmax on each rank
+        # local_max_logits, local_max_indices = target_logits.max(dim=-1)  # [num_tokens], [num_tokens]
+
+        # # Step 2: Allgather local results (token_id + logit_value)
+        # # Pack token_id and logit_value together for efficient communication
+        # local_results = torch.stack([
+        #     local_max_indices.float(),
+        #     local_max_logits
+        # ], dim=-1)  # [num_tokens, 2]
+
+        # gathered_results = tp_group.all_gather(local_results, dim=-1)  # [num_tokens, 2*tp_size]
+        # gathered_results = gathered_results.view(num_tokens, world_size, 2)  # [num_tokens, tp_size, 2]
+
+        # # Step 3: Find global argmax from gathered results
+        # gathered_logits = gathered_results[:, :, 1]  # [num_tokens, tp_size]
+        # gathered_indices = gathered_results[:, :, 0].long()  # [num_tokens, tp_size]
+
+        # # Find which rank has the maximum logit
+        # global_max_rank = gathered_logits.argmax(dim=-1)  # [num_tokens]
+
+        # # Gather the corresponding token ids
+        # target_argmax = gathered_indices.gather(dim=-1, index=global_max_rank.unsqueeze(-1)).squeeze(-1)  # [num_tokens]
+
         if HAS_TRITON:
             rejection_greedy_sample_with_triton(
                 output_token_ids,
@@ -167,57 +493,47 @@ def rejection_sample(
         if sampling_metadata.all_greedy:
             return output_token_ids
 
-    # Compute probability distribution from target logits.
-    target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
-    assert target_probs.is_contiguous()
+    # For random sampling with compressed logits
+    # target_logits is [num_tokens, top_k*tp_size] with indices [num_tokens, top_k*tp_size]
+    if target_indices is not None:
+        # Compressed mode: logits are [num_tokens, top_k*tp_size]
+        # We need to handle rejection sampling with compressed vocab
+        vocab_size = target_logits.shape[-1]
 
-    # Generate uniform probabilities for rejection sampling.
-    # [num_tokens]
-    uniform_probs = generate_uniform_probs(
-        num_tokens,
-        num_draft_tokens,
-        sampling_metadata.generators,
-        device,
-    )
+        # Compute probability distribution from target logits
+        target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+        assert target_probs.is_contiguous()
 
-    # Sample recovered tokens for each position.
-    # [num_tokens]
-    recovered_token_ids = sample_recovered_tokens(
-        max_spec_len,
-        num_draft_tokens,
-        cu_num_draft_tokens,
-        draft_token_ids,
-        draft_probs,
-        target_probs,
-        sampling_metadata,
-        device,
-    )
-    if not using_block_verify:
-        # Rejection sampling for random sampling requests.
-        if HAS_TRITON:
-            rejection_random_sample_kernel[(grid,)](
+        # Generate uniform probabilities for rejection sampling
+        uniform_probs = generate_uniform_probs(
+            num_tokens,
+            num_draft_tokens,
+            sampling_metadata.generators,
+            device,
+        )
+
+        # Sample recovered tokens for each position
+        recovered_token_ids = sample_recovered_tokens_compressed(
+            max_spec_len,
+            num_draft_tokens,
+            cu_num_draft_tokens,
+            draft_token_ids,
+            draft_probs,
+            target_probs,
+            target_indices,
+            sampling_metadata,
+            device,
+        )
+
+        if not using_block_verify:
+            # Rejection sampling for random sampling requests with compressed logits
+            rejection_random_sample_compressed_pytorch(
                 output_token_ids,
                 cu_num_draft_tokens,
                 draft_token_ids,
                 draft_probs,
                 target_probs,
-                bonus_token_ids,
-                recovered_token_ids,
-                uniform_probs.to(torch.float32),
-                is_greedy,
-                max_spec_len,
-                vocab_size,
-                batch_size,
-                NO_DRAFT_PROBS=draft_probs is None,
-                BLOCK_SIZE=block_size,
-            )
-        else:
-            rejection_random_sample_pytorch(
-                output_token_ids,
-                cu_num_draft_tokens,
-                draft_token_ids,
-                draft_probs,
-                target_probs,
+                target_indices,
                 bonus_token_ids,
                 recovered_token_ids,
                 uniform_probs,
@@ -225,44 +541,120 @@ def rejection_sample(
                 max_spec_len,
                 vocab_size,
                 IS_NGRAM=draft_probs is None,
-                # num_warps=1,
+            )
+        else:
+            rejection_random_sample_block_verify_compressed_pytorch(
+                output_token_ids,
+                cu_num_draft_tokens,
+                draft_token_ids,
+                draft_probs,
+                target_probs,
+                target_indices,
+                bonus_token_ids,
+                recovered_token_ids,
+                uniform_probs,
+                is_greedy,
+                max_spec_len,
+                vocab_size,
+                IS_NGRAM=draft_probs is None,
             )
     else:
-        # MagicMTP: Improving acceptance rate with Block Verify.
-        if HAS_TRITON:
-            rejection_random_sample_block_verify_kernel[(grid,)](
-                output_token_ids,
-                cu_num_draft_tokens,
-                draft_token_ids,
-                draft_probs,
-                target_probs,
-                bonus_token_ids,
-                recovered_token_ids,
-                uniform_probs.to(torch.float32),
-                is_greedy,
-                max_spec_len,
-                vocab_size,
-                batch_size,
-                NO_DRAFT_PROBS=draft_probs is None,
-                BLOCK_SIZE=block_size,
-            )
-        else:
-            rejection_random_sample_block_verify_pytorch(
-                output_token_ids,
-                cu_num_draft_tokens,
-                draft_token_ids,
-                draft_probs,
-                target_probs,
-                bonus_token_ids,
-                recovered_token_ids,
-                uniform_probs,
-                is_greedy,
-                max_spec_len,
-                vocab_size,
-                IS_NGRAM=draft_probs is None,
-            )
-    return output_token_ids
+        # Fallback to original uncompressed mode
+        # This path should not be used in the new distributed flow
+        vocab_size = target_logits.shape[-1]
 
+        # Compute probability distribution from target logits
+        target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+        assert target_probs.is_contiguous()
+
+        # Generate uniform probabilities for rejection sampling
+        uniform_probs = generate_uniform_probs(
+            num_tokens,
+            num_draft_tokens,
+            sampling_metadata.generators,
+            device,
+        )
+
+        # Sample recovered tokens for each position
+        recovered_token_ids = sample_recovered_tokens(
+            max_spec_len,
+            num_draft_tokens,
+            cu_num_draft_tokens,
+            draft_token_ids,
+            draft_probs,
+            target_probs,
+            sampling_metadata,
+            device,
+        )
+
+        if not using_block_verify:
+            if HAS_TRITON:
+                rejection_random_sample_kernel[(grid,)](
+                    output_token_ids,
+                    cu_num_draft_tokens,
+                    draft_token_ids,
+                    draft_probs,
+                    target_probs,
+                    bonus_token_ids,
+                    recovered_token_ids,
+                    uniform_probs.to(torch.float32),
+                    is_greedy,
+                    max_spec_len,
+                    vocab_size,
+                    batch_size,
+                    NO_DRAFT_PROBS=draft_probs is None,
+                    BLOCK_SIZE=block_size,
+                )
+            else:
+                rejection_random_sample_pytorch(
+                    output_token_ids,
+                    cu_num_draft_tokens,
+                    draft_token_ids,
+                    draft_probs,
+                    target_probs,
+                    bonus_token_ids,
+                    recovered_token_ids,
+                    uniform_probs,
+                    is_greedy,
+                    max_spec_len,
+                    vocab_size,
+                    IS_NGRAM=draft_probs is None,
+                )
+        else:
+            if HAS_TRITON:
+                rejection_random_sample_block_verify_kernel[(grid,)](
+                    output_token_ids,
+                    cu_num_draft_tokens,
+                    draft_token_ids,
+                    draft_probs,
+                    target_probs,
+                    bonus_token_ids,
+                    recovered_token_ids,
+                    uniform_probs.to(torch.float32),
+                    is_greedy,
+                    max_spec_len,
+                    vocab_size,
+                    batch_size,
+                    NO_DRAFT_PROBS=draft_probs is None,
+                    BLOCK_SIZE=block_size,
+                )
+            else:
+                rejection_random_sample_block_verify_pytorch(
+                    output_token_ids,
+                    cu_num_draft_tokens,
+                    draft_token_ids,
+                    draft_probs,
+                    target_probs,
+                    bonus_token_ids,
+                    recovered_token_ids,
+                    uniform_probs,
+                    is_greedy,
+                    max_spec_len,
+                    vocab_size,
+                    IS_NGRAM=draft_probs is None,
+                )
+
+    return output_token_ids
 
 def expand_batch_to_tokens(
     x: torch.Tensor,  # [batch_size]

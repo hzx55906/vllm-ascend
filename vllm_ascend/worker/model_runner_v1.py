@@ -111,6 +111,7 @@ from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.patch.worker.patch_module import patch_torch_npu_argsort
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
+from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
@@ -394,6 +395,11 @@ class NPUModelRunner(GPUModelRunner):
             ),
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
+        # if self.input_batch.top_k_cpu is not None:
+        #     print("self.input_batch0", self.input_batch)
+        #     self.sampler.prepare_sampling(self.input_batch.top_k_cpu[0])
+        # else:
+        #     print("self.input_batch", self.input_batch)
         self.num_draft_tokens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         # here we use int32
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -454,7 +460,7 @@ class NPUModelRunner(GPUModelRunner):
                 if self.speculative_config.method == "eagle3":
                     assert isinstance(self.drafter, AscendEagleProposer)
                     self.use_aux_hidden_state_outputs = self.drafter.eagle3_use_aux_hidden_state
-                self.rejection_sampler = RejectionSampler(self.sampler)
+                self.rejection_sampler = AscendRejectionSampler(self.sampler)
         self.discard_request_indices = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.num_discarded_requests = 0
 
@@ -1356,6 +1362,7 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            # print("000000000000000000")
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -1486,8 +1493,9 @@ class NPUModelRunner(GPUModelRunner):
             logits = logits.to(self.device).to(logits_dtype)
 
         with record_function_or_nullcontext("sample_token"):
+            # print("11111111111111111")
             sampler_output = self._sample(logits, spec_decode_metadata)
-
+            # if greedy:
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
                 self.sampling_done_event = torch.npu.Event()
@@ -1612,6 +1620,38 @@ class NPUModelRunner(GPUModelRunner):
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[: self.input_batch.num_reqs]
+            # print("self.input_batch0", self.input_batch.top_k_cpu)
+            # print("self.input_batch1", self.input_batch.top_p_cpu)
+            if self.input_batch.top_k_cpu is not None:
+                self.sampler.prepare_sampling(self.input_batch.top_k_cpu[0])
+            # if not sampling_metadata.all_random:
+            #     tp_group = get_tp_group()
+            #     B, V_local = logits.shape
+            #     rank = tp_group.rank_in_group
+            #     world_size = tp_group.world_size
+
+            #     local_max_logits, local_max_indices = logits.max(dim=-1)
+
+            #     local_global_idx = local_max_indices + rank * V_local  # [B]
+
+            #     # [B, world_size]
+            #     gathered_logits = tp_group.all_gather(local_max_logits, dim=-1)
+
+            #     gathered_global_idx = tp_group.all_gather(local_global_idx, dim=-1)  # [B, world_size]
+
+            #     logits_to_return = None
+            #     if self.logprobs_mode == "processed_logits":
+            #         logits_to_return = gathered_logits
+            #     elif self.logprobs_mode == "processed_logprobs":
+            #         logits_to_return = gathered_logits.log_softmax(dim=-1, dtype=torch.float32)
+            #     global_max_rank = gathered_logits.argmax(dim=-1)  # [B]
+
+            #     target_argmax = gathered_global_idx.gather(
+            #         dim=-1,
+            #         index=global_max_rank.unsqueeze(-1)
+            #     ).squeeze(-1)  # [B]
+            #     return target_argmax, logits_to_return
+            # else:
             return self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
@@ -1619,6 +1659,10 @@ class NPUModelRunner(GPUModelRunner):
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
+        # if self.input_batch.top_k_cpu is not None:
+        #     # print("self.input_batch0", self.input_batch.top_k_cpu)
+        #     self.rejection_sampler.prepare_sampling(self.input_batch.top_k_cpu[0])
+        # logits = tensor_model_parallel_all_gather(logits, -1) # [B, m*tp]
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             None,  # draft_probs

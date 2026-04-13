@@ -796,9 +796,9 @@ class SpecDecodeBaseProposer(EagleProposer):
             logits = logits[:num_indices]
             token_indices_to_sample = token_indices_to_sample[:num_indices]
 
-        # draft_token_ids = logits.argmax(dim=-1)
-        # print("draft_token_ids:", draft_token_ids.size, draft_token_ids)
-        # print("draft_token_ids1:", draft_token_ids1.size, draft_token_ids1)
+        # draft_token_ids1 = logits.argmax(dim=-1)
+        # print("draft_token_ids:", draft_token_ids.shape, draft_token_ids)
+        # print("draft_token_ids1:", draft_token_ids1.shape, draft_token_ids1)
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
             # [batch_size, 1]
@@ -925,9 +925,9 @@ class SpecDecodeBaseProposer(EagleProposer):
 
             # TODO(wenlong): get more than one token for tree attention
             hidden_states = hidden_states[:batch_size]
-            # draft_token_ids = logits.argmax(dim=-1)
-            # print("draft_token_ids2:", draft_token_ids.size, draft_token_ids)
-            # print("draft_token_ids21:", draft_token_ids1.size, draft_token_ids1)
+            # draft_token_ids1 = logits.argmax(dim=-1)
+            # print("draft_token_ids2:", draft_token_ids.shape, draft_token_ids)
+            # print("draft_token_ids21:", draft_token_ids1.shape, draft_token_ids1)
             draft_token_ids_tensor[draft_step + 1] = draft_token_ids
 
         # [batch_size, num_speculative_tokens]

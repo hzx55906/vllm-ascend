@@ -208,9 +208,8 @@ def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     local_global_idx = local_max_indices + rank * V_local  # [B]
 
     # [B, world_size]
-    gathered_logits = tp_group.all_gather(local_max_logits, dim=-1).view(B, world_size)
-
-    gathered_global_idx = tp_group.all_gather(local_global_idx, dim=-1).view(B, world_size)  # [B, world_size]
+    gathered_logits = tp_group.all_gather(local_max_logits.unsqueeze(-1), dim=-1)
+    gathered_global_idx = tp_group.all_gather(local_global_idx.unsqueeze(-1), dim=-1) # [B, world_size]
 
     global_max_rank = gathered_logits.argmax(dim=-1)  # [B]
 
@@ -358,36 +357,17 @@ def rejection_sample(
         is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE
     if HAS_TRITON:
         grid, block_size = cal_grid_and_block_size(batch_size)
-
     # For greedy sampling, we need to do allgather first to get global argmax
     if not sampling_metadata.all_random:
-        # Optimized greedy: local argmax -> allgather -> global argmax
-        # This reduces communication from vocab_size to 2 (token_id + logit_value) per token
+        # print("target_logits", target_logits.shape)
         target_argmax = greedy_sample(target_logits)
-        # target_logits = tensor_model_parallel_all_gather(target_logits, -1)
-        # target_argmax = target_logits.argmax(dim=-1)
-        # Step 1: Local argmax on each rank
-        # local_max_logits, local_max_indices = target_logits.max(dim=-1)  # [num_tokens], [num_tokens]
-
-        # # Step 2: Allgather local results (token_id + logit_value)
-        # # Pack token_id and logit_value together for efficient communication
-        # local_results = torch.stack([
-        #     local_max_indices.float(),
-        #     local_max_logits
-        # ], dim=-1)  # [num_tokens, 2]
-
-        # gathered_results = tp_group.all_gather(local_results, dim=-1)  # [num_tokens, 2*tp_size]
-        # gathered_results = gathered_results.view(num_tokens, world_size, 2)  # [num_tokens, tp_size, 2]
-
-        # # Step 3: Find global argmax from gathered results
-        # gathered_logits = gathered_results[:, :, 1]  # [num_tokens, tp_size]
-        # gathered_indices = gathered_results[:, :, 0].long()  # [num_tokens, tp_size]
-
-        # # Find which rank has the maximum logit
-        # global_max_rank = gathered_logits.argmax(dim=-1)  # [num_tokens]
-
-        # # Gather the corresponding token ids
-        # target_argmax = gathered_indices.gather(dim=-1, index=global_max_rank.unsqueeze(-1)).squeeze(-1)  # [num_tokens]
+        # tp_group = get_tp_group()
+        # target_logits1 = tp_group.all_gather(target_logits, dim=-1)
+        # target_argmax1 = target_logits1.argmax(dim=-1).view(-1)
+        # print("target_argmax", target_argmax)
+        # print("draft_token_ids", draft_token_ids.shape, draft_token_ids)
+        # print("cu_num_draft_tokens", cu_num_draft_tokens.shape, cu_num_draft_tokens)
+        # print("target_argmax1", target_argmax1)
 
         if HAS_TRITON:
             rejection_greedy_sample_with_triton(
@@ -422,6 +402,7 @@ def rejection_sample(
                     is_greedy,
                 )
         if sampling_metadata.all_greedy:
+            # print("output_token_ids", output_token_ids)
             return output_token_ids
 
     # For random sampling with compressed logits

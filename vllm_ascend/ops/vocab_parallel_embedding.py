@@ -38,7 +38,7 @@ from vllm.model_executor.utils import set_weight_attrs
 
 from vllm_ascend.distributed.parallel_state import get_embed_tp_group, get_lmhead_tp_group
 from vllm_ascend.utils import embedding_tp_enable, lmhead_tp_enable
-
+from vllm_ascend.ascend_config import get_ascend_config
 
 class AscendVocabParallelEmbedding(VocabParallelEmbedding):
     """
@@ -253,7 +253,10 @@ class AscendLogitsProcessor(LogitsProcessor):
         if lmhead_tp_enable():
             return self._get_logits_lmheadtp(hidden_states, lm_head, embedding_bias)
         else:
-            return self._get_logits_normal(hidden_states, lm_head, embedding_bias)
+            if get_ascend_config().enable_reduce_sample:
+                return self._get_logits_normal_v2(hidden_states, lm_head, embedding_bias)
+            else:
+                return self._get_logits_normal(hidden_states, lm_head, embedding_bias)
 
     def _get_logits_lmheadtp(
         self,
@@ -271,7 +274,7 @@ class AscendLogitsProcessor(LogitsProcessor):
             logits = logits[..., : self.org_vocab_size]
         return logits
 
-    def _get_logits_normal1(
+    def _get_logits_normal(
         self,
         hidden_states: torch.Tensor,
         lm_head: AscendParallelLMHead,
@@ -287,7 +290,7 @@ class AscendLogitsProcessor(LogitsProcessor):
 
         return logits
 
-    def _get_logits_normal(
+    def _get_logits_normal_v2(
         self,
         hidden_states: torch.Tensor,
         lm_head: AscendParallelLMHead,
@@ -297,11 +300,6 @@ class AscendLogitsProcessor(LogitsProcessor):
         # Gather logits for tensor parallel
         # logits = self._gather_logits(local_logits)
 
-        # # Remove paddings in vocab (if any)
-        # if logits is not None:
-        #     logits = logits[..., : self.org_vocab_size // self.tp_size]
-
         if local_logits is not None:
             local_logits = local_logits[..., : self.org_vocab_size // get_tp_group().world_size]
-        # return logits
         return local_logits

@@ -167,7 +167,10 @@ class AscendConfig:
 
         # Enable dispatch/combine op inter-node communication by ROCE
         self.enable_mc2_hierarchy_comm = additional_config.get("enable_mc2_hierarchy_comm", False)
-
+        
+        # Enable optimized reduce sampling scheme
+        self.enable_reduce_sample = additional_config.get("enable_reduce_sample", False)
+        
     @staticmethod
     def _get_compile_ranges(compilation_config):
         return compilation_config.compile_ranges_endpoints or []

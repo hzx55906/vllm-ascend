@@ -47,12 +47,7 @@ from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
-
-from vllm.distributed import (
-    get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
-    tensor_model_parallel_gather,
-)
+from vllm_ascend.ascend_config import get_ascend_config
 
 # Currently we will fix block size to a small one since `num_reqs` can't be too large
 _PREPARE_INPUTS_BLOCK_SIZE = 4
@@ -787,25 +782,22 @@ class SpecDecodeBaseProposer(EagleProposer):
             )
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
-        # logits = self.model.compute_logits(sample_hidden_states)
-        logits, draft_token_ids = self.model.compute_logits(sample_hidden_states)
-        # print("draft_token_ids", draft_token_ids)
-        # logits = tensor_model_parallel_all_gather(logits, -1) # [B, m*tp]
+
+        logits, draft_token_ids = self.model.compute_logits(sample_hidden_states, get_ascend_config().enable_reduce_sample)
         
         if lmhead_tp_enable() and num_indices < logits.shape[0]:
             logits = logits[:num_indices]
             token_indices_to_sample = token_indices_to_sample[:num_indices]
-
-        # draft_token_ids1 = logits.argmax(dim=-1)
-        # print("draft_token_ids:", draft_token_ids.shape, draft_token_ids)
-        # print("draft_token_ids1:", draft_token_ids1.shape, draft_token_ids1)
+        if not get_ascend_config().enable_reduce_sample:
+            draft_token_ids = logits.argmax(dim=-1)
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
             # [batch_size, 1]
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.pcp_size * self.dcp_size > 1 and is_prefill:
-            # draft_token_ids = logits.argmax(dim=-1)
+            if not get_ascend_config().enable_reduce_sample:
+                draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_list = []
             for _ in range(self.num_speculative_tokens):
                 draft_token_ids_list.append(draft_token_ids)
@@ -916,18 +908,16 @@ class SpecDecodeBaseProposer(EagleProposer):
                 )
 
             sample_hidden_states = last_hidden_states[token_indices_to_sample]
-            # logits = self.model.compute_logits(sample_hidden_states)
-            logits, draft_token_ids = self.model.compute_logits(sample_hidden_states)
-            # print("draft_token_ids", draft_token_ids)
+
+            logits, draft_token_ids = self.model.compute_logits(sample_hidden_states, get_ascend_config().enable_reduce_sample)
             if lmhead_tp_enable() and num_indices < logits.shape[0]:
                 logits = logits[:num_indices]
                 token_indices_to_sample = token_indices_to_sample[:num_indices]
 
             # TODO(wenlong): get more than one token for tree attention
             hidden_states = hidden_states[:batch_size]
-            # draft_token_ids1 = logits.argmax(dim=-1)
-            # print("draft_token_ids2:", draft_token_ids.shape, draft_token_ids)
-            # print("draft_token_ids21:", draft_token_ids1.shape, draft_token_ids1)
+            if not get_ascend_config().enable_reduce_sample:
+                draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_tensor[draft_step + 1] = draft_token_ids
 
         # [batch_size, num_speculative_tokens]

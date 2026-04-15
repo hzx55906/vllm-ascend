@@ -2,38 +2,44 @@ import numpy as np
 import torch
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.distributed.parallel_state import get_tp_group
-from vllm.distributed import tensor_model_parallel_all_gather
 
 def compute_logits(
     self,
     hidden_states: torch.Tensor,
+    enable_reduce_sample: bool = True,
 ) -> torch.Tensor | None:
-    logits = self.logits_processor(self.lm_head, hidden_states)
-    if self.draft_id_to_target_id is None:
-        assert logits.shape[1] == self.config.vocab_size, (
-            "Expected logits to have shape "
-            f"(*, {self.config.vocab_size}), but got {logits.shape}"
-        )
-        return logits
-    # print("logits0:",logits.shape)
-    logits = logits.contiguous()
-    next_token = greedy_sample(logits)
-    bias = torch.index_select(self.draft_id_to_target_id, dim=0, index=next_token.view(-1)).view(next_token.shape)
-    # print("logits1:", logits.shape)
-    # logits = tensor_model_parallel_all_gather(logits, -1)
-    # base = torch.arange(self.config.draft_vocab_size, device=logits.device)
-    # targets = base + self.draft_id_to_target_id
-    logits_new = logits.new_full(
-        (
-            logits.shape[0],
-            self.config.vocab_size,
-        ),
-        float("-inf"),
-    )
-    # logits_new[:, targets] = logits
-    # return logits_new
-    return logits_new, next_token + bias
+    if enable_reduce_sample:
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        if self.draft_id_to_target_id is None:
+            assert logits.shape[1] == self.config.vocab_size, (
+                "Expected logits to have shape "
+                f"(*, {self.config.vocab_size}), but got {logits.shape}"
+            )
+            return logits
+        logits = logits.contiguous()
+        next_token = greedy_sample(logits)
+        bias = torch.index_select(self.draft_id_to_target_id, dim=0, index=next_token.view(-1)).view(next_token.shape)
+        return None, next_token + bias
+    else:
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        if self.draft_id_to_target_id is None:
+            assert logits.shape[1] == self.config.vocab_size, (
+                "Expected logits to have shape "
+                f"(*, {self.config.vocab_size}), but got {logits.shape}"
+            )
+            return logits
 
+        base = torch.arange(self.config.draft_vocab_size, device=logits.device)
+        targets = base + self.draft_id_to_target_id
+        logits_new = logits.new_full(
+            (
+                logits.shape[0],
+                self.config.vocab_size,
+            ),
+            float("-inf"),
+        )
+        logits_new[:, targets] = logits
+        return logits_new, None
     
 def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     tp_group = get_tp_group()

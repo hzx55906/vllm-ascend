@@ -261,6 +261,36 @@ at::Tensor npu_sparse_flash_attention_meta(
     at::Tensor output = at::empty(query.sizes(), query.options().dtype(query.dtype()));
     return output;
 }
+std::tuple<at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor> add_rms_norm_dynamic_quant_ag_meta(
+    const at::Tensor & x1,
+    const at::Tensor & x2,
+    const at::Tensor & gamma,
+    const c10::optional<at::Tensor> & smooth_scale1,
+    const c10::optional<at::Tensor> & smooth_scale2,
+    const c10::optional<at::Tensor> & beta,
+    c10::string_view group,
+    int64_t group_size,
+    double epsilon,
+    ::std::array<bool,2> output_mask)
+{
+    auto group_ptr = const_cast<char *>(group.data());
+    auto output_size_0 = ([&]() { std::vector<int64_t> v(x1.sizes().begin(), x1.sizes().end()); v[0] *= group_size; return v; })();
+    auto output_size_1 = output_mask[1] ? x1.sizes() : at::IntArrayRef{};
+    auto output_size_2 = x1.sizes();
+    auto output_size_3 = ([&]() { std::vector<int64_t> v(x1.sizes().begin(), x1.sizes().end()); v[0] *= group_size; v.pop_back(); return v; })();
+    auto output_size_4 = output_mask[1] ? output_size_3 : std::vector<int64_t>{};
+    auto output_dtype_0 = at::kChar;
+    auto output_dtype_1 = x1.scalar_type();
+    auto output_dtype_2 = at::kFloat;
+    at::Tensor y1 = at::empty(output_size_0, x1.options().dtype(output_dtype_0));
+    at::Tensor y2 = at::empty(output_size_1, x1.options().dtype(output_dtype_0));
+    at::Tensor x_out = at::empty(output_size_2, x1.options().dtype(output_dtype_1));
+    at::Tensor scale1 = at::empty(output_size_3, x1.options().dtype(output_dtype_2));
+    at::Tensor scale2 = at::empty(output_size_4, x1.options().dtype(output_dtype_2));
+    // EXEC_NPU_CMD(aclnnAddRmsNormDynamicQuantAG, x1, x2, gamma, smooth_scale1, smooth_scale2, beta, group_ptr, group_size, epsilon, output_mask, y1, y2, x_out, scale1, scale2);
+    // return std::make_tuple(std::move(y1), std::move(y2), std::move(x_out), std::move(scale1), std::move(scale2));
+    return {y1, y2, x_out, scale1, scale2};
+}
 std::tuple<at::Tensor, at::Tensor> matmul_allreduce_add_rmsnorm_meta(
     const at::Tensor &x1,
     const at::Tensor &x2,
@@ -713,6 +743,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("dispatch_ffn_combine", &vllm_ascend::meta::dispatch_ffn_combine_meta);
     // matmul allreduce add rmsnorm
     ops.impl("matmul_allreduce_add_rmsnorm", &vllm_ascend::meta::matmul_allreduce_add_rmsnorm_meta);
+    // add_rms_norm_dynamic_quant_ag
+    ops.impl("add_rms_norm_dynamic_quant_ag", &vllm_ascend::meta::add_rms_norm_dynamic_quant_ag_meta);
     // moe_init_routing_custom
     ops.impl("npu_moe_init_routing_custom", &vllm_ascend::meta::npu_moe_init_routing_custom_meta);
     // Moe_gating_top_k

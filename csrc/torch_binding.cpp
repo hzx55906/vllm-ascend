@@ -38,6 +38,7 @@
 #include "grouped_matmul_swiglu_quant_weight_nz_tensor_list/grouped_matmul_swiglu_quant_torch_adpt.h"
 #include "lightning_indexer_vllm/lightning_indexer_vllm_torch_adpt.h"
 #include "matmul_allreduce_add_rmsnorm/matmul_allreduce_add_rmsnorm_torch_adpt.h"
+#include "add_rms_norm_dynamic_quant_ag/add_rms_norm_dynamic_quant_ag_torch_adpt.h"
 #include "mla_preprocess/mla_preprocess_torch_adpt.h"
 #include "moe_combine_normal/moe_combine_normal_torch_adpt.h"
 #include "moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
@@ -1153,6 +1154,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.def("matmul_allreduce_add_rmsnorm(Tensor x1, Tensor x2, Tensor residual, Tensor gamma, \
         str groupTp, int tpRankSize, int tpRankId, float epsilon, bool isTransB, bool isGatherAddOut) -> (Tensor output, Tensor add_out)");
     ops.impl("matmul_allreduce_add_rmsnorm", torch::kPrivateUse1, &vllm_ascend::matmul_allreduce_add_rmsnorm);
+
+    ops.def(
+        "add_rms_norm_dynamic_quant_ag(Tensor x1, Tensor x2, Tensor gamma, "
+        "                                          Tensor? smooth_scale1=None, Tensor? smooth_scale2=None, "
+        "                                          Tensor? beta=None, str group='', int group_size=0, "
+        "                                          float epsilon=1e-5, bool[] output_mask=[True, False]) "
+        "-> (Tensor y1, Tensor y2, Tensor x_out, Tensor scale1, Tensor scale2)");
+    ops.impl("add_rms_norm_dynamic_quant_ag", torch::kPrivateUse1, &vllm_ascend::add_rms_norm_dynamic_quant_ag);
 
     ops.def("get_dispatch_layout(Tensor topk_idx, int num_experts, int "
             "num_ranks) -> (Tensor num_tokens_per_rank, Tensor "

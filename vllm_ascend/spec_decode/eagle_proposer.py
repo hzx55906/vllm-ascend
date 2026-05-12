@@ -744,7 +744,7 @@ class SpecDecodeBaseProposer(EagleProposer):
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
 
-            draft_token_ids = self._runnable(
+            draft_token_ids, draft_logits = self._runnable(
                 num_input_tokens=num_input_tokens,
                 batch_size=batch_size,
                 token_indices_to_sample=self.token_indices_to_sample[:token_indices_to_sample_len],
@@ -758,7 +758,7 @@ class SpecDecodeBaseProposer(EagleProposer):
             forward_context = get_forward_context()
             if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
                 self._update_full_graph_params(forward_context, num_input_tokens, multi_steps_attn_metadata)
-        return draft_token_ids
+        return draft_token_ids, draft_logits
 
     def _run_merged_draft(
         self,
@@ -859,6 +859,10 @@ class SpecDecodeBaseProposer(EagleProposer):
             (self.num_speculative_tokens, *draft_token_ids.shape), dtype=draft_token_ids.dtype, device=self.device
         )
         draft_token_ids_tensor[0] = draft_token_ids
+        draft_logits_tensor = torch.zeros(
+            (self.num_speculative_tokens, *logits.shape), dtype=logits.dtype, device=self.device
+        )
+        draft_logits_tensor[0] = logits
         if self.uses_mrope:
             positions = self.mrope_positions[:, token_indices_to_sample]
         else:
@@ -969,10 +973,14 @@ class SpecDecodeBaseProposer(EagleProposer):
             hidden_states = hidden_states[:batch_size]
             draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_tensor[draft_step + 1] = draft_token_ids
+            draft_logits_tensor[draft_step + 1] = logits
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
-        return draft_token_ids
+        draft_logits = draft_logits_tensor.swapaxes(0, 1)
+        # print("draft_token_ids", draft_token_ids.shape)
+        # print("draft_logits", draft_logits.shape)
+        return draft_token_ids, draft_logits
 
     def set_inputs_first_pass(
         self,

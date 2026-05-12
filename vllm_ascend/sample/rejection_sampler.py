@@ -95,6 +95,7 @@ def rejection_sample(
     bonus_token_ids: torch.Tensor,
     sampling_metadata: SamplingMetadata,
 ) -> torch.Tensor:
+    draft_probs = draft_probs.contiguous().view(draft_probs.shape[0] * draft_probs.shape[1], -1)
     assert draft_token_ids.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
@@ -113,7 +114,8 @@ def rejection_sample(
     # When num_speculative_tokens>=3, using block verify.
     # Skip block verify when draft_probs is None (suffix/ngram methods)
     # to avoid incorrect verification results.
-    using_block_verify = max_spec_len >= 3 and draft_probs is not None
+    using_block_verify = False
+    # using_block_verify = max_spec_len >= 3 and draft_probs is not None
 
     # Create output buffer.
     output_token_ids = torch.empty(
@@ -169,7 +171,9 @@ def rejection_sample(
 
     # Compute probability distribution from target logits.
     target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+    draft_probs = draft_probs.softmax(dim=-1, dtype=torch.float32)
     assert target_probs.is_contiguous()
+    assert draft_probs.is_contiguous()
 
     # Generate uniform probabilities for rejection sampling.
     # [num_tokens]
@@ -187,7 +191,8 @@ def rejection_sample(
         num_draft_tokens,
         cu_num_draft_tokens,
         draft_token_ids,
-        draft_probs,
+        # draft_probs,
+        None,
         target_probs,
         sampling_metadata,
         device,
@@ -195,7 +200,8 @@ def rejection_sample(
     )
     if not using_block_verify:
         # Rejection sampling for random sampling requests.
-        if HAS_TRITON:
+        # if HAS_TRITON:
+        if False:
             rejection_random_sample_kernel[(grid,)](
                 output_token_ids,
                 cu_num_draft_tokens,
@@ -235,7 +241,8 @@ def rejection_sample(
                 output_token_ids,
                 cu_num_draft_tokens,
                 draft_token_ids,
-                draft_probs,
+                # draft_probs,
+                None,
                 target_probs,
                 bonus_token_ids,
                 recovered_token_ids,
@@ -244,7 +251,8 @@ def rejection_sample(
                 max_spec_len,
                 vocab_size,
                 batch_size,
-                NO_DRAFT_PROBS=draft_probs is None,
+                # NO_DRAFT_PROBS=draft_probs is None,
+                NO_DRAFT_PROBS=True,
                 BLOCK_SIZE=block_size,
                 SUB_BLOCK=4 * 1024,
             )
@@ -253,7 +261,8 @@ def rejection_sample(
                 output_token_ids,
                 cu_num_draft_tokens,
                 draft_token_ids,
-                draft_probs,
+                # draft_probs,
+                None,
                 target_probs,
                 bonus_token_ids,
                 recovered_token_ids,
@@ -261,7 +270,8 @@ def rejection_sample(
                 is_greedy,
                 max_spec_len,
                 vocab_size,
-                IS_NGRAM=draft_probs is None,
+                # IS_NGRAM=draft_probs is None,
+                IS_NGRAM=True,
             )
     return output_token_ids
 
@@ -344,12 +354,14 @@ def sample_recovered_tokens(
             recovered_token_ids,
             cu_num_draft_tokens,
             draft_token_ids,
-            draft_probs,
+            # draft_probs,
+            None,
             target_probs,
             q,
             vocab_size,
             triton.next_power_of_2(vocab_size),
-            NO_DRAFT_PROBS=draft_probs is None,
+            # NO_DRAFT_PROBS=draft_probs is None,
+            NO_DRAFT_PROBS = True,
             BLOCK_VERIFY=use_block_verify,
             SUB_BLOCK=4 * 1024,
             # TODO: enable multibuffer when accuracy problem is solved.
@@ -360,22 +372,26 @@ def sample_recovered_tokens(
             recovered_token_ids,
             cu_num_draft_tokens,
             draft_token_ids,
-            draft_probs,
+            # draft_probs,
+            None,
             target_probs,
             q,
             vocab_size,
-            IS_NGRAM=draft_probs is None,
+            # IS_NGRAM=draft_probs is None,
+            IS_NGRAM=True,
         )
     else:
         sample_recovered_tokens_pytorch(
             recovered_token_ids,
             cu_num_draft_tokens,
             draft_token_ids,
-            draft_probs,
+            # draft_probs,
+            None,
             target_probs,
             q,
             vocab_size,
-            IS_NGRAM=draft_probs is None,
+            # IS_NGRAM=draft_probs is None,
+            IS_NGRAM=True,
         )
     return recovered_token_ids
 
@@ -505,19 +521,21 @@ def rejection_random_sample_pytorch(
     global_token_indices = global_token_indices.clamp(0, draft_token_ids.shape[0] - 1)
     draft_tokens = draft_token_ids[global_token_indices]  # [batch_size, max_draft_len]
 
-    if IS_NGRAM:
-        ones_cpu = torch.ones(1, pin_memory=True, dtype=torch.float32)
-        draft_token_probs = ones_cpu.to(device, non_blocking=True).expand_as(draft_tokens)
-    else:
-        flat_indices = global_token_indices.flatten()
-        flat_draft_tokens = draft_tokens.flatten()
-        flat_draft_probs = draft_probs[flat_indices, flat_draft_tokens]
-        draft_token_probs = flat_draft_probs.view(batch_size, max_draft_len)
+    # if IS_NGRAM:
+    ones_cpu = torch.ones(1, pin_memory=True, dtype=torch.float32)
+    draft_token_probs = ones_cpu.to(device, non_blocking=True).expand_as(draft_tokens)
+    # else:
+    #     flat_indices = global_token_indices.flatten()
+    #     flat_draft_tokens = draft_tokens.flatten()
+    #     flat_draft_probs = draft_probs[flat_indices, flat_draft_tokens]
+    #     draft_token_probs = flat_draft_probs.view(batch_size, max_draft_len)
 
     flat_indices = global_token_indices.flatten()
     flat_draft_tokens = draft_tokens.flatten()
     flat_target_probs = target_probs[flat_indices, flat_draft_tokens]
     target_token_probs = flat_target_probs.view(batch_size, max_draft_len)
+    flat_draft_probs = draft_probs[flat_indices, flat_draft_tokens]
+    draft_token_probs = flat_draft_probs.view(batch_size, max_draft_len)
 
     uniform_token_probs = uniform_probs[global_token_indices]
     recovered_tokens = recovered_token_ids[global_token_indices]
@@ -525,10 +543,19 @@ def rejection_random_sample_pytorch(
     zero_threshold_cpu = torch.tensor([0.0], pin_memory=True, dtype=torch.float32)
     zero_threshold = zero_threshold_cpu.to(device, non_blocking=True)
 
-    acceptance_condition = (draft_token_probs > zero_threshold) & (
+    # acceptance_condition = (draft_token_probs > zero_threshold) & (
+    #     target_token_probs / draft_token_probs >= uniform_token_probs
+    # )
+    high_confidence_condition = draft_token_probs >= 0.9
+    # Also accept if the next token in the sequence has high draft confidence.
+    # Shift right by 1: position i accepts if position i+1 has draft_prob >= 0.95.
+    # next_high_confidence = torch.zeros_like(high_confidence_condition)
+    # next_high_confidence[:, :-1] = draft_token_probs[:, 1:] >= 0.95
+    standard_condition = (draft_token_probs > zero_threshold) & (
         target_token_probs / draft_token_probs >= uniform_token_probs
     )
-
+    # acceptance_condition = standard_condition
+    acceptance_condition = standard_condition | high_confidence_condition
     first_rejection = (~acceptance_condition) & valid_mask
 
     default_pos_cpu = torch.full([batch_size, 1], max_draft_len, pin_memory=True)

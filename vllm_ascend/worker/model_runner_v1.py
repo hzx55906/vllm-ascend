@@ -1334,7 +1334,7 @@ class NPUModelRunner(GPUModelRunner):
                     else:
                         target_hidden_states = hidden_states[token_indices]
             assert self.drafter is not None
-            draft_token_ids = self.drafter._propose(
+            draft_token_ids, draft_logits = self.drafter._propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
@@ -1354,7 +1354,7 @@ class NPUModelRunner(GPUModelRunner):
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
 
-        return draft_token_ids
+        return draft_token_ids, draft_logits
 
     @torch.inference_mode()
     def execute_model(
@@ -1796,7 +1796,7 @@ class NPUModelRunner(GPUModelRunner):
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
-            self._draft_token_ids = self.propose_draft_token_ids(
+            self._draft_token_ids, self._draft_logits = self.propose_draft_token_ids(
                 sampled_token_ids,
                 self.input_batch.sampling_metadata,
                 scheduler_output,
@@ -1929,7 +1929,8 @@ class NPUModelRunner(GPUModelRunner):
             logits = logits[: len(spec_decode_metadata.logits_indices)]
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
-            None,  # draft_probs
+            self._draft_logits,
+            # None,  # draft_probs
             logits,
             sampling_metadata,
         )

@@ -546,7 +546,7 @@ def rejection_random_sample_pytorch(
     # acceptance_condition = (draft_token_probs > zero_threshold) & (
     #     target_token_probs / draft_token_probs >= uniform_token_probs
     # )
-    high_confidence_condition = draft_token_probs >= 0.9
+    # high_confidence_condition = draft_token_probs >= 0.9
     # Also accept if the next token in the sequence has high draft confidence.
     # Shift right by 1: position i accepts if position i+1 has draft_prob >= 0.95.
     # next_high_confidence = torch.zeros_like(high_confidence_condition)
@@ -554,8 +554,8 @@ def rejection_random_sample_pytorch(
     standard_condition = (draft_token_probs > zero_threshold) & (
         target_token_probs / draft_token_probs >= uniform_token_probs
     )
-    # acceptance_condition = standard_condition
-    acceptance_condition = standard_condition | high_confidence_condition
+    acceptance_condition = standard_condition
+    # acceptance_condition = standard_condition | high_confidence_condition
     first_rejection = (~acceptance_condition) & valid_mask
 
     default_pos_cpu = torch.full([batch_size, 1], max_draft_len, pin_memory=True)
@@ -564,29 +564,67 @@ def rejection_random_sample_pytorch(
     first_reject_pos = torch.where(
         first_rejection.any(dim=1, keepdim=True), first_rejection.float().argmax(dim=1, keepdim=True), default_pos
     )
+
+    # Check whether the recovered token at the first rejection position differs
+    # from the next draft token. If they differ, force-accept the recovered
+    # token and add a bonus token after it. If they are the same, fall back
+    # to the original logic (stop at first rejection with recovered token).
+    # NOTE: After force-accepting, we do NOT continue verifying subsequent
+    # draft tokens because their draft_probs are computed under the wrong
+    # context (based on the rejected draft token, not the recovered token).
+    # This would make target_probs/draft_probs arbitrarily large, causing
+    # almost all subsequent tokens to be accepted and producing repetition.
+    next_pos = (first_reject_pos + 1).clamp(max=max_draft_len - 1)
+    recovered_at_reject = recovered_tokens.gather(1, first_reject_pos)  # [batch_size, 1]
+    draft_at_next = draft_tokens.gather(1, next_pos)  # [batch_size, 1]
+    next_pos_valid = (first_reject_pos + 1) < num_draft_per_batch[:, None]
+    has_first_rejection = first_rejection.any(dim=1, keepdim=True)
+    # should_force_accept: True when recovered token differs from next draft
+    # token → force-accept recovered token, skip remaining, add bonus.
+    should_force_accept = (recovered_at_reject != draft_at_next) & next_pos_valid & has_first_rejection
+
+    # When should_force_accept is True, the output extends one position past
+    # the first rejection (the recovered token gets accepted), so the bonus
+    # goes at first_reject_pos + 1. Otherwise (original logic), the recovered
+    # token is the last output, so bonus goes at first_reject_pos.
+    # When there is no rejection at all, both equal num_draft_per_batch.
+    bonus_pos_if_force = (first_reject_pos + 1).clamp(max=max_spec_len)
+    bonus_pos_if_original = first_reject_pos
+    effective_bonus_pos = torch.where(should_force_accept, bonus_pos_if_force, bonus_pos_if_original)
+
     pos_mask = pos_indices >= first_reject_pos
     should_skip = pos_mask & valid_mask
 
-    final_acceptance = acceptance_condition & (~should_skip)
     non_greedy_mask = ~is_greedy
     update_mask = non_greedy_mask[:, None] & valid_mask & (~should_skip)
 
+    # At the first rejection position:
+    # - should_force_accept=True → output recovered token (force-accept)
+    # - should_force_accept=False → output recovered token (original logic)
+    # In both cases the first rejection position gets the recovered token.
     first_reject_mask = (pos_indices == first_reject_pos) & valid_mask & non_greedy_mask[:, None]
     final_update_mask = update_mask | first_reject_mask
+
     final_tokens = torch.where(
         first_reject_mask,
         recovered_tokens,
-        torch.where(final_acceptance, draft_tokens, output_token_ids[:, :max_draft_len]),
+        torch.where(acceptance_condition, draft_tokens, output_token_ids[:, :max_draft_len]),
     )
 
     output_token_ids[:, :max_draft_len] = torch.where(
         final_update_mask, final_tokens, output_token_ids[:, :max_draft_len]
     )
 
+    # Add bonus at effective_bonus_pos.
     no_rejection = first_reject_pos.squeeze(1) >= num_draft_per_batch
     should_add_bonus = non_greedy_mask & no_rejection
 
-    bonus_positions = num_draft_per_batch  # [batch_size]
+    # For force-accept requests, always add bonus (recovered token is accepted,
+    # bonus is the next token after it). For original logic, only add bonus
+    # when there is no rejection.
+    should_add_bonus = should_add_bonus | (non_greedy_mask & should_force_accept.squeeze(1))
+
+    bonus_positions = effective_bonus_pos.squeeze(1)
 
     seq_len = output_token_ids.shape[1]
     all_positions_cpu = torch.arange(seq_len, pin_memory=True)

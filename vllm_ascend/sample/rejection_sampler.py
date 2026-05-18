@@ -375,8 +375,7 @@ def rejection_sample(
 
     # Compressed mode: logits are [num_tokens, top_k*tp_size]
     # with indices [num_tokens, top_k*tp_size]
-    compressed_vocab_size = target_logits.shape[-1]
-    global_vocab_size = draft_probs.shape[-1] if draft_probs is not None else compressed_vocab_size
+    vocab_size = target_logits.shape[-1]
 
     # Compute probability distribution from target logits
     target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
@@ -402,7 +401,6 @@ def rejection_sample(
         sampling_metadata,
         device,
         use_block_verify=using_block_verify,
-        global_vocab_size=global_vocab_size,
     )
 
     if not using_block_verify:
@@ -420,8 +418,7 @@ def rejection_sample(
                 uniform_probs.to(torch.float32),
                 is_greedy,
                 max_spec_len,
-                compressed_vocab_size,
-                global_vocab_size,
+                vocab_size,
                 batch_size,
                 NO_DRAFT_PROBS=draft_probs is None,
                 BLOCK_SIZE=block_size,
@@ -438,7 +435,7 @@ def rejection_sample(
                 uniform_probs,
                 is_greedy,
                 max_spec_len,
-                compressed_vocab_size,
+                vocab_size,
                 IS_NGRAM=draft_probs is None,
                 target_indices=target_indices,
             )
@@ -456,8 +453,7 @@ def rejection_sample(
                 uniform_probs.to(torch.float32),
                 is_greedy,
                 max_spec_len,
-                compressed_vocab_size,
-                global_vocab_size,
+                vocab_size,
                 batch_size,
                 NO_DRAFT_PROBS=draft_probs is None,
                 BLOCK_SIZE=block_size,
@@ -474,7 +470,7 @@ def rejection_sample(
                 uniform_probs,
                 is_greedy,
                 max_spec_len,
-                compressed_vocab_size,
+                vocab_size,
                 IS_NGRAM=draft_probs is None,
                 target_indices=target_indices,
             )
@@ -536,7 +532,6 @@ def sample_recovered_tokens(
     sampling_metadata: SamplingMetadata,
     device: torch.device,
     use_block_verify: bool = False,
-    global_vocab_size: int | None = None,
 ) -> torch.Tensor:
     batch_size = len(num_draft_tokens)
     vocab_size = target_probs.shape[-1]
@@ -567,10 +562,7 @@ def sample_recovered_tokens(
             target_indices,
             q,
             vocab_size,
-            global_vocab_size if global_vocab_size is not None else vocab_size,
-            triton.next_power_of_2(vocab_size),
             NO_DRAFT_PROBS=draft_probs is None,
-            BLOCK_VERIFY=use_block_verify,
             SUB_BLOCK=512,
             # TODO: enable multibuffer when accuracy problem is solved.
             multibuffer=False,
@@ -676,7 +668,7 @@ def rejection_random_sample_pytorch(
     cu_num_draft_tokens,  # [batch_size]
     draft_token_ids,  # [num_tokens]
     draft_probs,  # [num_tokens, vocab_size] or None
-    target_probs,  # [num_tokens, compressed_vocab_size]
+    target_probs,  # [num_tokens, vocab_size]
     bonus_token_ids,  # [batch_size]
     recovered_token_ids,  # [num_tokens]
     uniform_probs,  # [num_tokens]
@@ -684,7 +676,7 @@ def rejection_random_sample_pytorch(
     max_spec_len,
     vocab_size,
     IS_NGRAM=False,
-    target_indices=None,  # [num_tokens, compressed_vocab_size] global vocab indices
+    target_indices=None,  # [num_tokens, vocab_size] global vocab indices
 ):
     """
     This function implements the Speculative Decoding rejection sampling step.
@@ -868,11 +860,11 @@ def sample_recovered_tokens_pytorch(
     cu_num_draft_tokens,  # [batch_size]
     draft_token_ids,  # [num_tokens]
     draft_probs,  # [num_tokens, vocab_size] or None
-    target_probs,  # [num_tokens, compressed_vocab_size]
-    q,  # [batch_size, compressed_vocab_size]
+    target_probs,  # [num_tokens, vocab_size]
+    q,  # [batch_size, vocab_size]
     vocab_size,
     IS_NGRAM=False,
-    target_indices=None,  # [num_tokens, compressed_vocab_size] global vocab indices
+    target_indices=None,  # [num_tokens, vocab_size] global vocab indices
 ):
     """
     When a draft token is rejected, we must sample a "recovered" token from
@@ -965,7 +957,7 @@ def rejection_random_sample_block_verify_pytorch(
     cu_num_draft_tokens,  # [batch_size]
     draft_token_ids,  # [num_tokens]
     draft_probs,  # [num_tokens, vocab_size] or None
-    target_probs,  # [num_tokens, compressed_vocab_size]
+    target_probs,  # [num_tokens, vocab_size]
     bonus_token_ids,  # [batch_size]
     recovered_token_ids,  # [num_tokens]
     uniform_probs,  # [num_tokens]
@@ -973,7 +965,7 @@ def rejection_random_sample_block_verify_pytorch(
     max_spec_len,
     vocab_size,
     IS_NGRAM=False,
-    target_indices=None,  # [num_tokens, compressed_vocab_size] global vocab indices
+    target_indices=None,  # [num_tokens, vocab_size] global vocab indices
 ):
     batch_size = output_token_ids.shape[0]
     device = output_token_ids.device
@@ -1055,11 +1047,11 @@ def sample_recovered_tokens_blockwise_pytorch(
     cu_num_draft_tokens,  # [batch_size]
     draft_token_ids,  # [num_tokens]
     draft_probs,  # [num_tokens, vocab_size] or None
-    target_probs,  # [num_tokens, compressed_vocab_size]
-    q,  # [batch_size, compressed_vocab_size]
+    target_probs,  # [num_tokens, vocab_size]
+    q,  # [batch_size, vocab_size]
     vocab_size,
     IS_NGRAM=False,
-    target_indices=None,  # [num_tokens, compressed_vocab_size] global vocab indices
+    target_indices=None,  # [num_tokens, vocab_size] global vocab indices
 ):
     _ = vocab_size
     device = output_token_ids.device
@@ -1092,7 +1084,7 @@ def sample_recovered_tokens_blockwise_pytorch(
 
     # Get target probability for each draft token (compressed mode)
     draft_expanded = draft_token_ids[:, None]  # [num_tokens, 1]
-    is_in_candidates = target_indices == draft_expanded  # [num_tokens, compressed_vocab_size]
+    is_in_candidates = target_indices == draft_expanded  # [num_tokens, vocab_size]
     target_token_scalar_probs = torch.where(
         is_in_candidates,
         target_probs,

@@ -145,15 +145,14 @@ def rejection_random_sample_kernel(
     cu_num_draft_tokens_ptr,  # [batch_size]
     draft_token_ids_ptr,  # [num_tokens]
     draft_probs_ptr,  # [num_tokens, vocab_size] or None
-    target_probs_ptr,  # [num_tokens, compressed_vocab_size]
-    target_indices_ptr,  # [num_tokens, compressed_vocab_size] global vocab indices
+    target_probs_ptr,  # [num_tokens, vocab_size]
+    target_indices_ptr,  # [num_tokens, vocab_size] global vocab indices
     bonus_token_ids_ptr,  # [batch_size]
     recovered_token_ids_ptr,  # [num_tokens]
     uniform_probs_ptr,  # [num_tokens]
     is_greedy_ptr,  # [batch_size]
     max_spec_len,
-    vocab_size,  # compressed_vocab_size
-    global_vocab_size,  # global vocab size for draft_probs indexing
+    vocab_size,
     vec_len,
     NO_DRAFT_PROBS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -211,7 +210,7 @@ def rejection_random_sample_kernel(
                     if NO_DRAFT_PROBS:
                         draft_prob = 1.0
                     else:
-                        draft_prob = tl.load(draft_probs_ptr + token_idx * global_vocab_size + draft_token_id)
+                        draft_prob = tl.load(draft_probs_ptr + token_idx * vocab_size + draft_token_id)
 
                     uniform_prob = tl.load(uniform_probs_ptr + token_idx)
 
@@ -267,18 +266,15 @@ def expand_kernel(
 
 @triton.jit
 def sample_recovered_tokens_kernel(
-    output_token_ids_ptr,
-    cu_num_draft_tokens_ptr,
-    draft_token_ids_ptr,
-    draft_probs_ptr,
-    target_probs_ptr,
-    target_indices_ptr,
-    q_ptr,
-    compressed_vocab_size,
-    global_vocab_size,
-    PADDED_VOCAB_SIZE: tl.constexpr,
+    output_token_ids_ptr,  # [num_tokens]
+    cu_num_draft_tokens_ptr,  # [batch_size]
+    draft_token_ids_ptr,  # [num_tokens]
+    draft_probs_ptr,  # [num_tokens, vocab_size] or None
+    target_probs_ptr,  # [num_tokens, vocab_size]
+    target_indices_ptr, # [num_tokens, vocab_size] global vocab indices
+    q_ptr,  # [batch_size, vocab_size]
+    vocab_size,
     NO_DRAFT_PROBS: tl.constexpr,
-    BLOCK_VERIFY: tl.constexpr,
     SUB_BLOCK: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
@@ -294,7 +290,7 @@ def sample_recovered_tokens_kernel(
 
     token_idx = start_idx + pos
 
-    C = compressed_vocab_size
+    C = vocab_size
     n_loop = tl.cdiv(C, SUB_BLOCK)
 
     global_max_p = tl.full((), -float("inf"), tl.float32)
@@ -315,8 +311,8 @@ def sample_recovered_tokens_kernel(
             is_draft = (gidx == draft_token_id) & mask
             prob = tl.where(is_draft, 0.0, tprob)
         else:
-            valid = (gidx >= 0) & (gidx < global_vocab_size) & mask
-            dprob = tl.load(draft_probs_ptr + token_idx * global_vocab_size + gidx, mask=valid, other=0.0).to(
+            valid = (gidx >= 0) & (gidx < vocab_size) & mask
+            dprob = tl.load(draft_probs_ptr + token_idx * vocab_size + gidx, mask=valid, other=0.0).to(
                 tl.float32
             )
             prob = tl.maximum(tprob - dprob, 0.0)
@@ -397,15 +393,14 @@ def rejection_random_sample_block_verify_kernel(
     cu_num_draft_tokens_ptr,  # [batch_size]
     draft_token_ids_ptr,  # [num_tokens]
     draft_probs_ptr,  # [num_tokens, vocab_size] or None
-    target_probs_ptr,  # [num_tokens, compressed_vocab_size]
-    target_indices_ptr,  # [num_tokens, compressed_vocab_size] global vocab indices
+    target_probs_ptr,  # [num_tokens, vocab_size]
+    target_indices_ptr,  # [num_tokens, vocab_size] global vocab indices
     bonus_token_ids_ptr,  # [batch_size]
     recovered_token_ids_ptr,  # [num_tokens]
     uniform_probs_ptr,  # [num_tokens]
     is_greedy_ptr,  # [batch_size]
     max_spec_len,
-    vocab_size,  # compressed_vocab_size
-    global_vocab_size,  # global vocab size for draft_probs indexing
+    vocab_size,
     vec_len,
     NO_DRAFT_PROBS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -464,7 +459,7 @@ def rejection_random_sample_block_verify_kernel(
                 if NO_DRAFT_PROBS:
                     draft_prob = 1.0
                 else:
-                    draft_prob = tl.load(draft_probs_ptr + token_idx * global_vocab_size + draft_token_id)
+                    draft_prob = tl.load(draft_probs_ptr + token_idx * vocab_size + draft_token_id)
 
                 pi = min(pi * target_prob / draft_prob, 1.0)
                 if draft_prob > 0 and pi >= uniform_prob:

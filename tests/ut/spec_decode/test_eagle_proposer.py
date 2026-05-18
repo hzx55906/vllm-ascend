@@ -2114,7 +2114,7 @@ class MockDraftModel:
             return last_hidden_states, hidden_states
         return last_hidden_states
 
-    def compute_logits(self, sample_hidden_states, enable_reduce_sample=None):
+    def compute_logits(self, sample_hidden_states):
         self.logit_inputs.append(sample_hidden_states.clone())
         token_ids = sample_hidden_states[:, 0].to(torch.long)
         logits = torch.full((sample_hidden_states.shape[0], self.vocab_size), -1000.0)
@@ -2342,7 +2342,7 @@ class TestRunMergedDraft(TestBase):
         assert sig_name == ["self", "input_ids", "positions", "hidden_states", "inputs_embeds"]
         sig = inspect.signature(RunnerCls.compute_logits)
         sig_name = self.get_param_names(sig)
-        assert sig_name == ["self", "hidden_states", "enable_reduce_sample"]
+        assert sig_name == ["self", "hidden_states"]
 
         import vllm_ascend.ascend_forward_context
 
@@ -2461,9 +2461,6 @@ class TestRunMergedDraft(TestBase):
         multi_steps_attn_metadata = [MagicMock(), MagicMock(), MagicMock()]
 
         mock_vllm_config = MagicMock()
-        mock_vllm_config.additional_config = {
-            "enable_reduce_sample": True
-        }
 
         with (
             patch.object(eagle_proposer, "lmhead_tp_enable", return_value=False),
@@ -2531,9 +2528,6 @@ class TestRunMergedDraft(TestBase):
         )
 
         mock_vllm_config = MagicMock()
-        mock_vllm_config.additional_config = {
-            "enable_reduce_sample": True
-        }
 
         with (
             patch.object(eagle_proposer, "lmhead_tp_enable", return_value=False),
@@ -2589,9 +2583,6 @@ class TestRunMergedDraft(TestBase):
         multi_steps_attn_metadata = [MagicMock(), MagicMock(), MagicMock()]
 
         mock_vllm_config = MagicMock()
-        mock_vllm_config.additional_config = {
-            "enable_reduce_sample": True
-        }
         with (
             patch.object(eagle_proposer, "lmhead_tp_enable", return_value=True),
             patch("vllm.config.get_current_vllm_config",return_value=mock_vllm_config),
@@ -2650,9 +2641,6 @@ class TestRunMergedDraft(TestBase):
             (2, True, torch.tensor([0, 1, 2, 3], dtype=torch.int64), (2, 2)),
         ]
         mock_vllm_config = MagicMock()
-        mock_vllm_config.additional_config = {
-            "enable_reduce_sample": True
-        }
 
         for num_speculative_tokens, parallel_drafting, token_indices_to_sample, expected_shape in test_cases:
             with self.subTest(num_speculative_tokens=num_speculative_tokens, parallel_drafting=parallel_drafting):

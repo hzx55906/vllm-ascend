@@ -273,7 +273,7 @@ class AscendLogitsProcessor(LogitsProcessor):
         logits = local_logits[rank * batch_size : (rank + 1) * batch_size]
         # Remove paddings in vocab (if any)
         if logits is not None:
-            logits = logits[..., : self.org_vocab_size]
+            logits = logits[..., : lm_head.num_org_embeddings_per_partition]
         return logits
 
     def _get_logits_normal(

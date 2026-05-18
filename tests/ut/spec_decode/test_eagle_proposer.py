@@ -2119,6 +2119,7 @@ class MockDraftModel:
         token_ids = sample_hidden_states[:, 0].to(torch.long)
         logits = torch.full((sample_hidden_states.shape[0], self.vocab_size), -1000.0)
         logits[torch.arange(sample_hidden_states.shape[0]), token_ids] = 1000.0
+        logits = logits.argmax(dim=-1)
         return logits
 
     def embed_input_ids(self, input_ids):
@@ -2460,12 +2461,8 @@ class TestRunMergedDraft(TestBase):
         forward_context.attn_metadata = None
         multi_steps_attn_metadata = [MagicMock(), MagicMock(), MagicMock()]
 
-        mock_vllm_config = MagicMock()
-
         with (
             patch.object(eagle_proposer, "lmhead_tp_enable", return_value=False),
-            patch("vllm.config.get_current_vllm_config",return_value=mock_vllm_config),
-            # patch.object(eagle_proposer, "get_ascend_config", return_value=mock_ascend_config),
             patch.object(eagle_proposer, "get_forward_context", return_value=forward_context),
         ):
             draft_token_ids = self.proposer._run_merged_draft(
@@ -2527,12 +2524,7 @@ class TestRunMergedDraft(TestBase):
             }
         )
 
-        mock_vllm_config = MagicMock()
-
-        with (
-            patch.object(eagle_proposer, "lmhead_tp_enable", return_value=False),
-            patch("vllm.config.get_current_vllm_config",return_value=mock_vllm_config),
-        ):
+        with patch.object(eagle_proposer, "lmhead_tp_enable", return_value=False):
             draft_token_ids = self.proposer._run_merged_draft(
                 num_input_tokens=12,
                 batch_size=2,
@@ -2582,10 +2574,8 @@ class TestRunMergedDraft(TestBase):
         forward_context.attn_metadata = None
         multi_steps_attn_metadata = [MagicMock(), MagicMock(), MagicMock()]
 
-        mock_vllm_config = MagicMock()
         with (
             patch.object(eagle_proposer, "lmhead_tp_enable", return_value=True),
-            patch("vllm.config.get_current_vllm_config",return_value=mock_vllm_config),
             patch.object(eagle_proposer, "get_forward_context", return_value=forward_context),
         ):
             draft_token_ids = self.proposer._run_merged_draft(
@@ -2640,8 +2630,6 @@ class TestRunMergedDraft(TestBase):
             (1, False, torch.tensor([1, 3], dtype=torch.int64), (2, 1)),
             (2, True, torch.tensor([0, 1, 2, 3], dtype=torch.int64), (2, 2)),
         ]
-        mock_vllm_config = MagicMock()
-
         for num_speculative_tokens, parallel_drafting, token_indices_to_sample, expected_shape in test_cases:
             with self.subTest(num_speculative_tokens=num_speculative_tokens, parallel_drafting=parallel_drafting):
                 self.proposer.method = "eagle3"
@@ -2652,10 +2640,7 @@ class TestRunMergedDraft(TestBase):
                 self.proposer.input_ids[:4] = torch.tensor([279, 1196, 374, 8014], dtype=torch.int32)
                 self.proposer.positions[:4] = torch.tensor([17, 18, 19, 20], dtype=torch.int64)
 
-                with (
-                    patch.object(eagle_proposer, "lmhead_tp_enable", return_value=False),
-                     patch("vllm.config.get_current_vllm_config",return_value=mock_vllm_config),
-                ):
+                with patch.object(eagle_proposer, "lmhead_tp_enable", return_value=False):
                     draft_token_ids = self.proposer._run_merged_draft(
                         num_input_tokens=4,
                         batch_size=2,
@@ -3489,6 +3474,7 @@ class TestEagleProposerPrepareInputsPadded:
 
 @npu_test(num_npus=1, npu_type="a2")
 class TestEagleProposerSetInputsFirstPass:
+class TestEagleProposerSetInputsFirstPass:
     """Test set_inputs_first_pass for AscendEagleProposer.
 
     This test class covers all branches of set_inputs_first_pass:
@@ -4111,6 +4097,13 @@ class TestEagleProposerSetInputsFirstPass:
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
 
+        assert proposer.net_num_new_slots_per_request == 1
+        assert proposer.needs_extra_input_slots
+        assert out_num_tokens == 7
+
+        assert torch.equal(
+            proposer.input_ids[:out_num_tokens],
+            torch.tensor([10, 11, 100, 0, 20, 21, 200], dtype=torch.int32, device=self.device),
         assert proposer.net_num_new_slots_per_request == 1
         assert proposer.needs_extra_input_slots
         assert out_num_tokens == 7

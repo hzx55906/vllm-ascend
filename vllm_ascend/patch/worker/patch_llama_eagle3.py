@@ -6,38 +6,17 @@ from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 def compute_logits(
     self,
     hidden_states: torch.Tensor,
-    enable_reduce_sample: bool = True,
 ) -> torch.Tensor | None:
-    if enable_reduce_sample:
-        logits = self.logits_processor(self.lm_head, hidden_states)
-        if self.draft_id_to_target_id is None:
-            assert logits.shape[1] == self.config.vocab_size, (
-                f"Expected logits to have shape (*, {self.config.vocab_size}), but got {logits.shape}"
-            )
-            return logits
-        logits = logits.contiguous()
-        next_token = greedy_sample(logits)
-        bias = torch.index_select(self.draft_id_to_target_id, dim=0, index=next_token.view(-1)).view(next_token.shape)
-        return next_token + bias
-    else:
-        logits = self.logits_processor(self.lm_head, hidden_states)
-        if self.draft_id_to_target_id is None:
-            assert logits.shape[1] == self.config.vocab_size, (
-                f"Expected logits to have shape (*, {self.config.vocab_size}), but got {logits.shape}"
-            )
-            return logits
-
-        base = torch.arange(self.config.draft_vocab_size, device=logits.device)
-        targets = base + self.draft_id_to_target_id
-        logits_new = logits.new_full(
-            (
-                logits.shape[0],
-                self.config.vocab_size,
-            ),
-            float("-inf"),
+    logits = self.logits_processor(self.lm_head, hidden_states)
+    if self.draft_id_to_target_id is None:
+        assert logits.shape[1] == self.config.vocab_size, (
+            f"Expected logits to have shape (*, {self.config.vocab_size}), but got {logits.shape}"
         )
-        logits_new[:, targets] = logits
-        return logits_new
+        return logits
+    logits = logits.contiguous()
+    next_token = greedy_sample(logits)
+    bias = torch.index_select(self.draft_id_to_target_id, dim=0, index=next_token.view(-1)).view(next_token.shape)
+    return next_token + bias
 
 
 def greedy_sample(logits: torch.Tensor) -> torch.Tensor:

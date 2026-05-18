@@ -36,7 +36,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import get_embed_tp_group, get_lmhead_tp_group
 from vllm_ascend.utils import embedding_tp_enable, lmhead_tp_enable
 
@@ -266,7 +265,13 @@ class AscendLogitsProcessor(LogitsProcessor):
         gathered_hidden_states = get_lmhead_tp_group().all_gather(hidden_states, dim=0)
         local_logits = lm_head.quant_method.apply(lm_head, gathered_hidden_states, bias=embedding_bias)
         # Gather logits for tensor parallel
-        logits = get_lmhead_tp_group().all_to_all(local_logits)
+        # logits = get_lmhead_tp_group().all_to_all(local_logits)
+        tp_size = get_lmhead_tp_group().world_size
+        rank = get_lmhead_tp_group().rank
+
+        batch_size = local_logits.shape[0] // tp_size
+
+        logits = local_logits[rank * batch_size : (rank + 1) * batch_size]
         # Remove paddings in vocab (if any)
         if logits is not None:
             logits = logits[..., : self.org_vocab_size]
@@ -279,15 +284,11 @@ class AscendLogitsProcessor(LogitsProcessor):
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor | None:
         logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
-        # Gather logits for tensor parallel
-        if not get_ascend_config().enable_reduce_sample:
-            logits = self._gather_logits(logits)
+        # Skip gathering logits across TP ranks - reduce sampling handles
+        # distributed vocab by only all-gathering top-k candidates later.
 
         # Remove paddings in vocab (if any)
         if logits is not None:
-            if not get_ascend_config().enable_reduce_sample:
-                logits = logits[..., : self.org_vocab_size]
-            else:
-                logits = logits[..., : lm_head.num_org_embeddings_per_partition]
+            logits = logits[..., : lm_head.num_org_embeddings_per_partition]
 
         return logits

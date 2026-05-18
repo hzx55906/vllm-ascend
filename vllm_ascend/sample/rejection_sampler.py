@@ -17,7 +17,6 @@ from vllm.v1.sample.rejection_sampler import (
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ops.triton.reject_sample import (
     cal_grid_and_block_size,
     expand_triton,
@@ -261,10 +260,7 @@ def apply_sampling_constraints(
 
     # New flow: top_k -> allgather -> top_p
     # Returns processed logits and indices
-    if get_ascend_config().enable_reduce_sample:
-        return apply_top_k_top_p(logits, k, p, top_k)
-    else:
-        return apply_top_k_top_p(logits, k, p)
+    return apply_top_k_top_p(logits, k, p, top_k)
 
 
 def rejection_sample(
@@ -277,10 +273,8 @@ def rejection_sample(
     cu_num_draft_tokens: torch.Tensor,
     # [num_tokens, vocab_size]
     draft_probs: torch.Tensor | None,
-    # [num_tokens, vocab_size//tp_size] or tuple of (logits, indices)
-    # For greedy: Tensor [num_tokens, vocab_size//tp_size]
-    # For random: tuple of (logits [num_tokens, top_k*tp_size], indices [num_tokens, top_k*tp_size])
-    target_logits_or_tuple: torch.Tensor | tuple[torch.Tensor, torch.Tensor | None],
+    # tuple of (logits [num_tokens, top_k*tp_size], indices [num_tokens, top_k*tp_size])
+    target_logits_or_tuple: tuple[torch.Tensor, torch.Tensor],
     # [batch_size, 1]
     bonus_token_ids: torch.Tensor,
     sampling_metadata: SamplingMetadata,
@@ -296,23 +290,16 @@ def rejection_sample(
         max_spec_len: Maximum speculative length
         cu_num_draft_tokens: Cumulative draft tokens [batch_size]
         draft_probs: Draft probabilities [num_tokens, vocab_size] or None for ngram
-        target_logits_or_tuple: Target logits or tuple of (logits, indices)
-            - For greedy: Tensor [num_tokens, vocab_size//tp_size]
-            - For random: tuple of (compressed_logits, indices) where
-                - compressed_logits: [num_tokens, top_k*tp_size]
-                - indices: [num_tokens, top_k*tp_size] global vocabulary indices or None
+        target_logits_or_tuple: tuple of (compressed_logits, indices) where
+            - compressed_logits: [num_tokens, top_k*tp_size]
+            - indices: [num_tokens, top_k*tp_size] global vocabulary indices
         bonus_token_ids: Bonus token IDs [batch_size, 1]
         sampling_metadata: Sampling metadata
 
     Returns:
         output_token_ids: [batch_size, max_spec_len + 1]
     """
-    # Unpack target_logits_or_tuple
-    if isinstance(target_logits_or_tuple, tuple):
-        target_logits, target_indices = target_logits_or_tuple
-    else:
-        target_logits = target_logits_or_tuple
-        target_indices = None
+    target_logits, target_indices = target_logits_or_tuple
 
     assert draft_token_ids.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
@@ -349,10 +336,7 @@ def rejection_sample(
         grid, block_size = cal_grid_and_block_size(batch_size)
     # For greedy sampling, we need to do allgather first to get global argmax
     if not sampling_metadata.all_random:
-        if get_ascend_config().enable_reduce_sample:
-            target_argmax = greedy_sample(target_logits)
-        else:
-            target_argmax = target_logits.argmax(dim=-1).view(-1)
+        target_argmax = greedy_sample(target_logits)
 
         if HAS_TRITON:
             rejection_greedy_sample_with_triton(
@@ -389,228 +373,111 @@ def rejection_sample(
         if sampling_metadata.all_greedy:
             return output_token_ids
 
-    # For random sampling with compressed logits
-    # target_logits is [num_tokens, top_k*tp_size] with indices [num_tokens, top_k*tp_size]
-    if target_indices is not None:
-        # Compressed mode: logits are [num_tokens, top_k*tp_size]
-        # We need to handle rejection sampling with compressed vocab
-        compressed_vocab_size = target_logits.shape[-1]
-        global_vocab_size = draft_probs.shape[-1] if draft_probs is not None else compressed_vocab_size
+    # Compressed mode: logits are [num_tokens, top_k*tp_size]
+    # with indices [num_tokens, top_k*tp_size]
+    compressed_vocab_size = target_logits.shape[-1]
+    global_vocab_size = draft_probs.shape[-1] if draft_probs is not None else compressed_vocab_size
 
-        # Compute probability distribution from target logits
-        target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
-        assert target_probs.is_contiguous()
+    # Compute probability distribution from target logits
+    target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+    assert target_probs.is_contiguous()
 
-        # Generate uniform probabilities for rejection sampling
-        uniform_probs = generate_uniform_probs(
-            num_tokens,
-            num_draft_tokens,
-            sampling_metadata.generators,
-            device,
-        )
+    # Generate uniform probabilities for rejection sampling
+    uniform_probs = generate_uniform_probs(
+        num_tokens,
+        num_draft_tokens,
+        sampling_metadata.generators,
+        device,
+    )
 
-        # Sample recovered tokens for each position
-        recovered_token_ids = sample_recovered_tokens(
-            max_spec_len,
-            num_draft_tokens,
-            cu_num_draft_tokens,
-            draft_token_ids,
-            draft_probs,
-            target_probs,
-            sampling_metadata,
-            device,
-            use_block_verify=using_block_verify,
-            target_indices=target_indices,
-            global_vocab_size=global_vocab_size,
-            compressed_mode=True,
-        )
+    # Sample recovered tokens for each position
+    recovered_token_ids = sample_recovered_tokens(
+        max_spec_len,
+        num_draft_tokens,
+        cu_num_draft_tokens,
+        draft_token_ids,
+        draft_probs,
+        target_probs,
+        target_indices,
+        sampling_metadata,
+        device,
+        use_block_verify=using_block_verify,
+        global_vocab_size=global_vocab_size,
+    )
 
-        if not using_block_verify:
-            # Rejection sampling for random sampling requests with compressed logits
-            if HAS_TRITON:
-                rejection_random_sample_kernel[(grid,)](
-                    output_token_ids,
-                    cu_num_draft_tokens,
-                    draft_token_ids,
-                    draft_probs,
-                    target_probs,
-                    target_indices,
-                    bonus_token_ids,
-                    recovered_token_ids,
-                    uniform_probs.to(torch.float32),
-                    is_greedy,
-                    max_spec_len,
-                    compressed_vocab_size,
-                    global_vocab_size,
-                    batch_size,
-                    NO_DRAFT_PROBS=draft_probs is None,
-                    COMPRESSED_MODE=True,
-                    BLOCK_SIZE=block_size,
-                )
-            else:
-                rejection_random_sample_pytorch(
-                    output_token_ids,
-                    cu_num_draft_tokens,
-                    draft_token_ids,
-                    draft_probs,
-                    target_probs,
-                    bonus_token_ids,
-                    recovered_token_ids,
-                    uniform_probs,
-                    is_greedy,
-                    max_spec_len,
-                    compressed_vocab_size,
-                    IS_NGRAM=draft_probs is None,
-                    target_indices=target_indices,
-                    compressed_mode=True,
-                )
+    if not using_block_verify:
+        # Rejection sampling for random sampling requests with compressed logits
+        if HAS_TRITON:
+            rejection_random_sample_kernel[(grid,)](
+                output_token_ids,
+                cu_num_draft_tokens,
+                draft_token_ids,
+                draft_probs,
+                target_probs,
+                target_indices,
+                bonus_token_ids,
+                recovered_token_ids,
+                uniform_probs.to(torch.float32),
+                is_greedy,
+                max_spec_len,
+                compressed_vocab_size,
+                global_vocab_size,
+                batch_size,
+                NO_DRAFT_PROBS=draft_probs is None,
+                BLOCK_SIZE=block_size,
+            )
         else:
-            if HAS_TRITON:
-                rejection_random_sample_block_verify_kernel[(grid,)](
-                    output_token_ids,
-                    cu_num_draft_tokens,
-                    draft_token_ids,
-                    draft_probs,
-                    target_probs,
-                    target_indices,
-                    bonus_token_ids,
-                    recovered_token_ids,
-                    uniform_probs.to(torch.float32),
-                    is_greedy,
-                    max_spec_len,
-                    compressed_vocab_size,
-                    global_vocab_size,
-                    batch_size,
-                    NO_DRAFT_PROBS=draft_probs is None,
-                    COMPRESSED_MODE=True,
-                    BLOCK_SIZE=block_size,
-                )
-            else:
-                rejection_random_sample_block_verify_pytorch(
-                    output_token_ids,
-                    cu_num_draft_tokens,
-                    draft_token_ids,
-                    draft_probs,
-                    target_probs,
-                    bonus_token_ids,
-                    recovered_token_ids,
-                    uniform_probs,
-                    is_greedy,
-                    max_spec_len,
-                    compressed_vocab_size,
-                    IS_NGRAM=draft_probs is None,
-                    target_indices=target_indices,
-                    compressed_mode=True,
-                )
+            rejection_random_sample_pytorch(
+                output_token_ids,
+                cu_num_draft_tokens,
+                draft_token_ids,
+                draft_probs,
+                target_probs,
+                bonus_token_ids,
+                recovered_token_ids,
+                uniform_probs,
+                is_greedy,
+                max_spec_len,
+                compressed_vocab_size,
+                IS_NGRAM=draft_probs is None,
+                target_indices=target_indices,
+            )
     else:
-        # Fallback to original uncompressed mode
-        # This path should not be used in the new distributed flow
-        vocab_size = target_logits.shape[-1]
-
-        # Compute probability distribution from target logits
-        target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
-        assert target_probs.is_contiguous()
-
-        # Generate uniform probabilities for rejection sampling
-        uniform_probs = generate_uniform_probs(
-            num_tokens,
-            num_draft_tokens,
-            sampling_metadata.generators,
-            device,
-        )
-
-        # Sample recovered tokens for each position
-        recovered_token_ids = sample_recovered_tokens(
-            max_spec_len,
-            num_draft_tokens,
-            cu_num_draft_tokens,
-            draft_token_ids,
-            draft_probs,
-            target_probs,
-            sampling_metadata,
-            device,
-            use_block_verify=using_block_verify,
-            target_indices=None,
-            global_vocab_size=vocab_size,
-            compressed_mode=False,
-        )
-
-        if not using_block_verify:
-            if HAS_TRITON:
-                rejection_random_sample_kernel[(grid,)](
-                    output_token_ids,
-                    cu_num_draft_tokens,
-                    draft_token_ids,
-                    draft_probs,
-                    target_probs,
-                    None,  # target_indices
-                    bonus_token_ids,
-                    recovered_token_ids,
-                    uniform_probs.to(torch.float32),
-                    is_greedy,
-                    max_spec_len,
-                    vocab_size,
-                    vocab_size,  # global_vocab_size
-                    batch_size,
-                    NO_DRAFT_PROBS=draft_probs is None,
-                    COMPRESSED_MODE=False,
-                    BLOCK_SIZE=block_size,
-                )
-            else:
-                rejection_random_sample_pytorch(
-                    output_token_ids,
-                    cu_num_draft_tokens,
-                    draft_token_ids,
-                    draft_probs,
-                    target_probs,
-                    bonus_token_ids,
-                    recovered_token_ids,
-                    uniform_probs,
-                    is_greedy,
-                    max_spec_len,
-                    vocab_size,
-                    IS_NGRAM=draft_probs is None,
-                    target_indices=None,
-                    compressed_mode=False,
-                )
+        if HAS_TRITON:
+            rejection_random_sample_block_verify_kernel[(grid,)](
+                output_token_ids,
+                cu_num_draft_tokens,
+                draft_token_ids,
+                draft_probs,
+                target_probs,
+                target_indices,
+                bonus_token_ids,
+                recovered_token_ids,
+                uniform_probs.to(torch.float32),
+                is_greedy,
+                max_spec_len,
+                compressed_vocab_size,
+                global_vocab_size,
+                batch_size,
+                NO_DRAFT_PROBS=draft_probs is None,
+                BLOCK_SIZE=block_size,
+            )
         else:
-            if HAS_TRITON:
-                rejection_random_sample_block_verify_kernel[(grid,)](
-                    output_token_ids,
-                    cu_num_draft_tokens,
-                    draft_token_ids,
-                    draft_probs,
-                    target_probs,
-                    None,  # target_indices
-                    bonus_token_ids,
-                    recovered_token_ids,
-                    uniform_probs.to(torch.float32),
-                    is_greedy,
-                    max_spec_len,
-                    vocab_size,
-                    vocab_size,  # global_vocab_size
-                    batch_size,
-                    NO_DRAFT_PROBS=draft_probs is None,
-                    COMPRESSED_MODE=False,
-                    BLOCK_SIZE=block_size,
-                )
-            else:
-                rejection_random_sample_block_verify_pytorch(
-                    output_token_ids,
-                    cu_num_draft_tokens,
-                    draft_token_ids,
-                    draft_probs,
-                    target_probs,
-                    bonus_token_ids,
-                    recovered_token_ids,
-                    uniform_probs,
-                    is_greedy,
-                    max_spec_len,
-                    vocab_size,
-                    IS_NGRAM=draft_probs is None,
-                    target_indices=None,
-                    compressed_mode=False,
-                )
+            rejection_random_sample_block_verify_pytorch(
+                output_token_ids,
+                cu_num_draft_tokens,
+                draft_token_ids,
+                draft_probs,
+                target_probs,
+                bonus_token_ids,
+                recovered_token_ids,
+                uniform_probs,
+                is_greedy,
+                max_spec_len,
+                compressed_vocab_size,
+                IS_NGRAM=draft_probs is None,
+                target_indices=target_indices,
+            )
 
     return output_token_ids
 
@@ -665,12 +532,11 @@ def sample_recovered_tokens(
     draft_token_ids: torch.Tensor,
     draft_probs: torch.Tensor | None,
     target_probs: torch.Tensor,
+    target_indices: torch.Tensor,
     sampling_metadata: SamplingMetadata,
     device: torch.device,
     use_block_verify: bool = False,
-    target_indices: torch.Tensor | None = None,
     global_vocab_size: int | None = None,
-    compressed_mode: bool = False,
 ) -> torch.Tensor:
     batch_size = len(num_draft_tokens)
     vocab_size = target_probs.shape[-1]
@@ -698,14 +564,13 @@ def sample_recovered_tokens(
             draft_token_ids,
             draft_probs,
             target_probs,
-            target_indices,  # None for uncompressed mode
+            target_indices,
             q,
             vocab_size,
             global_vocab_size if global_vocab_size is not None else vocab_size,
             triton.next_power_of_2(vocab_size),
             NO_DRAFT_PROBS=draft_probs is None,
             BLOCK_VERIFY=use_block_verify,
-            COMPRESSED_MODE=compressed_mode,
             SUB_BLOCK=512,
             # TODO: enable multibuffer when accuracy problem is solved.
             multibuffer=False,
@@ -721,7 +586,6 @@ def sample_recovered_tokens(
             vocab_size,
             IS_NGRAM=draft_probs is None,
             target_indices=target_indices,
-            compressed_mode=compressed_mode,
         )
     else:
         sample_recovered_tokens_pytorch(
@@ -734,7 +598,6 @@ def sample_recovered_tokens(
             vocab_size,
             IS_NGRAM=draft_probs is None,
             target_indices=target_indices,
-            compressed_mode=compressed_mode,
         )
     return recovered_token_ids
 
@@ -813,7 +676,7 @@ def rejection_random_sample_pytorch(
     cu_num_draft_tokens,  # [batch_size]
     draft_token_ids,  # [num_tokens]
     draft_probs,  # [num_tokens, vocab_size] or None
-    target_probs,  # [num_tokens, vocab_size] or [num_tokens, compressed_vocab_size]
+    target_probs,  # [num_tokens, compressed_vocab_size]
     bonus_token_ids,  # [batch_size]
     recovered_token_ids,  # [num_tokens]
     uniform_probs,  # [num_tokens]
@@ -822,7 +685,6 @@ def rejection_random_sample_pytorch(
     vocab_size,
     IS_NGRAM=False,
     target_indices=None,  # [num_tokens, compressed_vocab_size] global vocab indices
-    compressed_mode=False,
 ):
     """
     This function implements the Speculative Decoding rejection sampling step.
@@ -875,30 +737,23 @@ def rejection_random_sample_pytorch(
         flat_draft_probs = draft_probs[flat_indices, flat_draft_tokens]
         draft_token_probs = flat_draft_probs.view(batch_size, max_draft_len)
 
-    # Get target token probs
-    if compressed_mode:
-        # For compressed mode, need to search for draft token in candidates
-        flat_global_indices = global_token_indices.flatten()
-        flat_draft_tokens = draft_tokens.flatten()
+    # Get target token probs (compressed mode: search for draft token in candidates)
+    flat_global_indices = global_token_indices.flatten()
+    flat_draft_tokens = draft_tokens.flatten()
 
-        flat_target_indices = target_indices[flat_global_indices]
-        flat_target_probs = target_probs[flat_global_indices]
+    flat_target_indices = target_indices[flat_global_indices]
+    flat_target_probs = target_probs[flat_global_indices]
 
-        # Check if draft token is in candidates
-        draft_expanded = flat_draft_tokens.unsqueeze(1)
-        is_in_candidates = flat_target_indices == draft_expanded
+    # Check if draft token is in candidates
+    draft_expanded = flat_draft_tokens.unsqueeze(1)
+    is_in_candidates = flat_target_indices == draft_expanded
 
-        # Get the probability of draft token from target (if present)
-        target_token_probs_flat = torch.where(
-            is_in_candidates, flat_target_probs, torch.tensor(0.0, device=device)
-        ).sum(dim=1)
+    # Get the probability of draft token from target (if present)
+    target_token_probs_flat = torch.where(
+        is_in_candidates, flat_target_probs, torch.tensor(0.0, device=device)
+    ).sum(dim=1)
 
-        target_token_probs = target_token_probs_flat.view(batch_size, max_draft_len)
-    else:
-        flat_indices = global_token_indices.flatten()
-        flat_draft_tokens = draft_tokens.flatten()
-        flat_target_probs = target_probs[flat_indices, flat_draft_tokens]
-        target_token_probs = flat_target_probs.view(batch_size, max_draft_len)
+    target_token_probs = target_token_probs_flat.view(batch_size, max_draft_len)
 
     uniform_token_probs = uniform_probs[global_token_indices]
     recovered_tokens = recovered_token_ids[global_token_indices]
@@ -1013,12 +868,11 @@ def sample_recovered_tokens_pytorch(
     cu_num_draft_tokens,  # [batch_size]
     draft_token_ids,  # [num_tokens]
     draft_probs,  # [num_tokens, vocab_size] or None
-    target_probs,  # [num_tokens, vocab_size] or [num_tokens, compressed_vocab_size]
-    q,  # [batch_size, vocab_size] or [batch_size, compressed_vocab_size]
+    target_probs,  # [num_tokens, compressed_vocab_size]
+    q,  # [batch_size, compressed_vocab_size]
     vocab_size,
     IS_NGRAM=False,
     target_indices=None,  # [num_tokens, compressed_vocab_size] global vocab indices
-    compressed_mode=False,
 ):
     """
     When a draft token is rejected, we must sample a "recovered" token from
@@ -1065,47 +919,30 @@ def sample_recovered_tokens_pytorch(
     has_match = in_range_mask.any(dim=1)
     token_to_batch = torch.where(has_match, token_to_batch, 0)
 
-    if compressed_mode:
-        # Compressed mode: target_probs is [num_tokens, compressed_vocab_size]
-        # target_indices maps compressed indices to global vocab indices
-        if IS_NGRAM:
-            # Zero out the draft token in target_probs
-            prob = target_probs.clone()
-            for i in range(num_tokens):
-                draft_id = draft_token_ids[i]
-                mask = target_indices[i] == draft_id
-                prob[i, mask] = 0
-        else:
-            # Gather draft probs at candidate indices
-            flat_indices = target_indices.flatten()
-            token_offsets = torch.arange(num_tokens, device=device)[:, None] * draft_probs.shape[1]
-            flat_token_offsets = token_offsets.expand_as(target_indices).flatten()
-
-            draft_probs_flat = draft_probs.flatten()
-            valid_mask = flat_indices < draft_probs.shape[1]
-            flat_draft_probs_at_indices = torch.where(
-                valid_mask, draft_probs_flat[flat_token_offsets + flat_indices], torch.tensor(0.0, device=device)
-            )
-            draft_probs_at_indices = flat_draft_probs_at_indices.view(num_tokens, vocab_size)
-
-            prob = torch.maximum(
-                target_probs - draft_probs_at_indices,
-                torch.tensor(0.0, device=device),
-            )
+    if IS_NGRAM:
+        # Zero out the draft token in target_probs
+        prob = target_probs.clone()
+        for i in range(num_tokens):
+            draft_id = draft_token_ids[i]
+            mask = target_indices[i] == draft_id
+            prob[i, mask] = 0
     else:
-        # Uncompressed mode
-        if IS_NGRAM:
-            token_indices = torch.arange(num_tokens, device=device)
+        # Gather draft probs at candidate indices
+        flat_indices = target_indices.flatten()
+        token_offsets = torch.arange(num_tokens, device=device)[:, None] * draft_probs.shape[1]
+        flat_token_offsets = token_offsets.expand_as(target_indices).flatten()
 
-            modified_target_probs = target_probs.clone()
-            modified_target_probs[token_indices, draft_token_ids] = 0
-            prob = modified_target_probs
+        draft_probs_flat = draft_probs.flatten()
+        valid_mask = flat_indices < draft_probs.shape[1]
+        flat_draft_probs_at_indices = torch.where(
+            valid_mask, draft_probs_flat[flat_token_offsets + flat_indices], torch.tensor(0.0, device=device)
+        )
+        draft_probs_at_indices = flat_draft_probs_at_indices.view(num_tokens, vocab_size)
 
-        else:
-            prob = torch.maximum(
-                target_probs - draft_probs,
-                torch.tensor(0.0, pin_memory=True).to(device, non_blocking=True),
-            )
+        prob = torch.maximum(
+            target_probs - draft_probs_at_indices,
+            torch.tensor(0.0, device=device),
+        )
 
     q_values = q[token_to_batch]  # [num_tokens, vocab_size]
 
@@ -1117,14 +954,10 @@ def sample_recovered_tokens_pytorch(
 
     prob_over_q = torch.where((q_values == 0) | torch.isinf(q_values), -1e10, prob_over_q)
 
-    if compressed_mode:
-        # Get the index in compressed vocab
-        compressed_indices = torch.argmax(prob_over_q, dim=1)
-        # Convert to global vocabulary indices
-        output_token_ids[:] = target_indices[torch.arange(num_tokens, device=device), compressed_indices]
-    else:
-        recovered_ids = torch.argmax(prob_over_q, dim=1)
-        output_token_ids[:] = recovered_ids
+    # Get the index in compressed vocab
+    compressed_indices = torch.argmax(prob_over_q, dim=1)
+    # Convert to global vocabulary indices
+    output_token_ids[:] = target_indices[torch.arange(num_tokens, device=device), compressed_indices]
 
 
 def rejection_random_sample_block_verify_pytorch(
@@ -1132,7 +965,7 @@ def rejection_random_sample_block_verify_pytorch(
     cu_num_draft_tokens,  # [batch_size]
     draft_token_ids,  # [num_tokens]
     draft_probs,  # [num_tokens, vocab_size] or None
-    target_probs,  # [num_tokens, vocab_size] or [num_tokens, compressed_vocab_size]
+    target_probs,  # [num_tokens, compressed_vocab_size]
     bonus_token_ids,  # [batch_size]
     recovered_token_ids,  # [num_tokens]
     uniform_probs,  # [num_tokens]
@@ -1141,7 +974,6 @@ def rejection_random_sample_block_verify_pytorch(
     vocab_size,
     IS_NGRAM=False,
     target_indices=None,  # [num_tokens, compressed_vocab_size] global vocab indices
-    compressed_mode=False,
 ):
     batch_size = output_token_ids.shape[0]
     device = output_token_ids.device
@@ -1168,30 +1000,23 @@ def rejection_random_sample_block_verify_pytorch(
         flat_draft_probs = draft_probs[flat_indices, flat_draft_tokens]
         draft_token_probs = flat_draft_probs.view(batch_size, max_spec_len)
 
-    # Get target token probs
-    if compressed_mode:
-        # For compressed mode, need to search for draft token in candidates
-        flat_global_indices = global_token_indices.flatten()
-        flat_draft_tokens = draft_tokens.flatten()
+    # Get target token probs (compressed mode: search for draft token in candidates)
+    flat_global_indices = global_token_indices.flatten()
+    flat_draft_tokens = draft_tokens.flatten()
 
-        flat_target_indices = target_indices[flat_global_indices]
-        flat_target_probs = target_probs[flat_global_indices]
+    flat_target_indices = target_indices[flat_global_indices]
+    flat_target_probs = target_probs[flat_global_indices]
 
-        # Check if draft token is in candidates
-        draft_expanded = flat_draft_tokens.unsqueeze(1)
-        is_in_candidates = flat_target_indices == draft_expanded
+    # Check if draft token is in candidates
+    draft_expanded = flat_draft_tokens.unsqueeze(1)
+    is_in_candidates = flat_target_indices == draft_expanded
 
-        # Get the probability of draft token from target (if present)
-        target_token_probs_flat = torch.where(
-            is_in_candidates, flat_target_probs, torch.tensor(0.0, device=device)
-        ).sum(dim=1)
+    # Get the probability of draft token from target (if present)
+    target_token_probs_flat = torch.where(
+        is_in_candidates, flat_target_probs, torch.tensor(0.0, device=device)
+    ).sum(dim=1)
 
-        target_token_probs = target_token_probs_flat.view(batch_size, max_spec_len)
-    else:
-        flat_indices = global_token_indices.flatten()
-        flat_draft_tokens = draft_tokens.flatten()
-        flat_target_probs = target_probs[flat_indices, flat_draft_tokens]
-        target_token_probs = flat_target_probs.view(batch_size, max_spec_len)
+    target_token_probs = target_token_probs_flat.view(batch_size, max_spec_len)
 
     uniform_token_probs = uniform_probs[global_token_indices]
     recovered_tokens = recovered_token_ids[global_token_indices]
@@ -1230,12 +1055,11 @@ def sample_recovered_tokens_blockwise_pytorch(
     cu_num_draft_tokens,  # [batch_size]
     draft_token_ids,  # [num_tokens]
     draft_probs,  # [num_tokens, vocab_size] or None
-    target_probs,  # [num_tokens, vocab_size] or [num_tokens, compressed_vocab_size]
-    q,  # [batch_size, vocab_size] or [batch_size, compressed_vocab_size]
+    target_probs,  # [num_tokens, compressed_vocab_size]
+    q,  # [batch_size, compressed_vocab_size]
     vocab_size,
     IS_NGRAM=False,
     target_indices=None,  # [num_tokens, compressed_vocab_size] global vocab indices
-    compressed_mode=False,
 ):
     _ = vocab_size
     device = output_token_ids.device
@@ -1266,20 +1090,14 @@ def sample_recovered_tokens_blockwise_pytorch(
     else:
         draft_token_scalar_probs = draft_probs[token_indices, draft_token_ids]
 
-    # Get target probability for each draft token
-    if compressed_mode:
-        # In compressed mode, target_probs is [num_tokens, compressed_vocab_size]
-        # and target_indices maps compressed positions to global vocab indices.
-        # We need to search for draft_token_id in the compressed candidates.
-        draft_expanded = draft_token_ids[:, None]  # [num_tokens, 1]
-        is_in_candidates = target_indices == draft_expanded  # [num_tokens, compressed_vocab_size]
-        target_token_scalar_probs = torch.where(
-            is_in_candidates,
-            target_probs,
-            torch.tensor(0.0, device=device),
-        ).sum(dim=1)  # [num_tokens]
-    else:
-        target_token_scalar_probs = target_probs[token_indices, draft_token_ids]
+    # Get target probability for each draft token (compressed mode)
+    draft_expanded = draft_token_ids[:, None]  # [num_tokens, 1]
+    is_in_candidates = target_indices == draft_expanded  # [num_tokens, compressed_vocab_size]
+    target_token_scalar_probs = torch.where(
+        is_in_candidates,
+        target_probs,
+        torch.tensor(0.0, device=device),
+    ).sum(dim=1)  # [num_tokens]
 
     per_token_ratio = torch.where(
         draft_token_scalar_probs > 0,
@@ -1297,38 +1115,28 @@ def sample_recovered_tokens_blockwise_pytorch(
     p_i = p_prefix[token_to_batch, pos_in_seq]
     p_i_expanded = p_i[:, None]
 
-    if compressed_mode:
-        # Compressed mode: residual computation with compressed vocab
-        if IS_NGRAM:
-            # Zero out the draft token in target_probs
-            prob = target_probs.clone()
-            for i in range(num_tokens):
-                draft_id = draft_token_ids[i]
-                mask = target_indices[i] == draft_id
-                prob[i, mask] = 0
-            residual = torch.clamp(p_i_expanded * prob, min=0.0)
-        else:
-            # Gather draft probs at candidate indices (same as sample_recovered_tokens_pytorch)
-            flat_indices = target_indices.flatten()
-            token_offsets = torch.arange(num_tokens, device=device)[:, None] * draft_probs.shape[1]
-            flat_token_offsets = token_offsets.expand_as(target_indices).flatten()
-
-            draft_probs_flat = draft_probs.flatten()
-            valid_mask = flat_indices < draft_probs.shape[1]
-            flat_draft_probs_at_indices = torch.where(
-                valid_mask, draft_probs_flat[flat_token_offsets + flat_indices], torch.tensor(0.0, device=device)
-            )
-            draft_probs_at_indices = flat_draft_probs_at_indices.view(num_tokens, -1)
-
-            residual = torch.clamp(p_i_expanded * target_probs - draft_probs_at_indices, min=0.0)
+    if IS_NGRAM:
+        # Zero out the draft token in target_probs
+        prob = target_probs.clone()
+        for i in range(num_tokens):
+            draft_id = draft_token_ids[i]
+            mask = target_indices[i] == draft_id
+            prob[i, mask] = 0
+        residual = torch.clamp(p_i_expanded * prob, min=0.0)
     else:
-        # Uncompressed mode
-        if IS_NGRAM:
-            modified_target = target_probs.clone()
-            modified_target[token_indices, draft_token_ids] = 0.0
-            residual = torch.clamp(p_i_expanded * modified_target, min=0.0)
-        else:
-            residual = torch.clamp(p_i_expanded * target_probs - draft_probs, min=0.0)
+        # Gather draft probs at candidate indices (same as sample_recovered_tokens_pytorch)
+        flat_indices = target_indices.flatten()
+        token_offsets = torch.arange(num_tokens, device=device)[:, None] * draft_probs.shape[1]
+        flat_token_offsets = token_offsets.expand_as(target_indices).flatten()
+
+        draft_probs_flat = draft_probs.flatten()
+        valid_mask = flat_indices < draft_probs.shape[1]
+        flat_draft_probs_at_indices = torch.where(
+            valid_mask, draft_probs_flat[flat_token_offsets + flat_indices], torch.tensor(0.0, device=device)
+        )
+        draft_probs_at_indices = flat_draft_probs_at_indices.view(num_tokens, -1)
+
+        residual = torch.clamp(p_i_expanded * target_probs - draft_probs_at_indices, min=0.0)
 
     q_values = q[token_to_batch]
     epsilon = 1e-10
@@ -1340,9 +1148,6 @@ def sample_recovered_tokens_blockwise_pytorch(
         residual / q_values_safe,
     )
 
-    if compressed_mode:
-        # Get the index in compressed vocab, then convert to global vocab indices
-        compressed_indices = torch.argmax(prob_over_q, dim=1)
-        output_token_ids[:] = target_indices[torch.arange(num_tokens, device=device), compressed_indices]
-    else:
-        output_token_ids[:] = torch.argmax(prob_over_q, dim=1)
+    # Get the index in compressed vocab, then convert to global vocab indices
+    compressed_indices = torch.argmax(prob_over_q, dim=1)
+    output_token_ids[:] = target_indices[torch.arange(num_tokens, device=device), compressed_indices]

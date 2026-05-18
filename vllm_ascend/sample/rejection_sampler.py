@@ -749,9 +749,9 @@ def rejection_random_sample_pytorch(
     is_in_candidates = flat_target_indices == draft_expanded
 
     # Get the probability of draft token from target (if present)
-    target_token_probs_flat = torch.where(
-        is_in_candidates, flat_target_probs, torch.tensor(0.0, device=device)
-    ).sum(dim=1)
+    target_token_probs_flat = torch.where(is_in_candidates, flat_target_probs, torch.tensor(0.0, device=device)).sum(
+        dim=1
+    )
 
     target_token_probs = target_token_probs_flat.view(batch_size, max_draft_len)
 
@@ -1012,9 +1012,9 @@ def rejection_random_sample_block_verify_pytorch(
     is_in_candidates = flat_target_indices == draft_expanded
 
     # Get the probability of draft token from target (if present)
-    target_token_probs_flat = torch.where(
-        is_in_candidates, flat_target_probs, torch.tensor(0.0, device=device)
-    ).sum(dim=1)
+    target_token_probs_flat = torch.where(is_in_candidates, flat_target_probs, torch.tensor(0.0, device=device)).sum(
+        dim=1
+    )
 
     target_token_probs = target_token_probs_flat.view(batch_size, max_spec_len)
 

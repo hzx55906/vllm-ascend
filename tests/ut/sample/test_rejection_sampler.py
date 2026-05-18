@@ -1,4 +1,4 @@
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -210,6 +210,7 @@ class TestAscendRejectionSampler(TestBase):
 
         assert output_token_ids[0].item() == 0
         assert output_token_ids[1].item() == 1
+
     @patch("torch.arange", new=mock_pin_memory(torch.arange))
     @patch("torch.ones", new=mock_pin_memory(torch.ones))
     @patch("torch.full", new=mock_pin_memory(torch.full))
@@ -217,9 +218,7 @@ class TestAscendRejectionSampler(TestBase):
     def test_reduce_sample_recovered_tokens_pytorch_ngram(self):
         mock_vllm_config = MagicMock()
 
-        mock_vllm_config.additional_config = {
-            "enable_reduce_sample": True
-        }
+        mock_vllm_config.additional_config = {"enable_reduce_sample": True}
 
         with patch(
             "vllm.config.get_current_vllm_config",
@@ -273,9 +272,7 @@ class TestAscendRejectionSampler(TestBase):
     def test_rejection_random_reduce_sample_block_verify_pytorch(self):
         mock_vllm_config = MagicMock()
 
-        mock_vllm_config.additional_config = {
-            "enable_reduce_sample": True
-        }
+        mock_vllm_config.additional_config = {"enable_reduce_sample": True}
 
         with patch(
             "vllm.config.get_current_vllm_config",
@@ -343,9 +340,7 @@ class TestAscendRejectionSampler(TestBase):
     def test_reduce_sample_recovered_tokens_blockwise_pytorch_ngram(self):
         mock_vllm_config = MagicMock()
 
-        mock_vllm_config.additional_config = {
-            "enable_reduce_sample": True
-        }
+        mock_vllm_config.additional_config = {"enable_reduce_sample": True}
 
         with patch(
             "vllm.config.get_current_vllm_config",
@@ -399,9 +394,7 @@ class TestAscendRejectionSampler(TestBase):
     def test_reduce_sample_recovered_tokens_blockwise_pytorch(self):
         mock_vllm_config = MagicMock()
 
-        mock_vllm_config.additional_config = {
-            "enable_reduce_sample": True
-        }
+        mock_vllm_config.additional_config = {"enable_reduce_sample": True}
 
         with patch(
             "vllm.config.get_current_vllm_config",

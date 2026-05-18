@@ -916,7 +916,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
-        # draft_token_ids = self.model.compute_logits(sample_hidden_states)
         logits = self.model.compute_logits(sample_hidden_states)
 
         if lmhead_tp_enable() and num_indices < logits.shape[0]:
@@ -1049,10 +1048,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 )
 
             sample_hidden_states = last_hidden_states[token_indices_to_sample]
-            logits = self.model.compute_logits(
-                sample_hidden_states
-            )
-            
+            logits = self.model.compute_logits(sample_hidden_states)
+
             if lmhead_tp_enable() and num_indices < logits.shape[0]:
                 logits = logits[:num_indices]
                 token_indices_to_sample = token_indices_to_sample[:num_indices]

@@ -452,9 +452,7 @@ class TestAscendRejectionSampler(TestBase):
     def test_rejection_random_sample_block_verify_pytorch(self):
         mock_vllm_config = MagicMock()
 
-        mock_vllm_config.additional_config = {
-            "enable_reduce_sample": True
-        }
+        mock_vllm_config.additional_config = {"enable_reduce_sample": True}
 
         with patch(
             "vllm.config.get_current_vllm_config",
@@ -513,9 +511,7 @@ class TestAscendRejectionSampler(TestBase):
     def test_rejection_random_reduce_sample_pytorch(self):
         mock_vllm_config = MagicMock()
 
-        mock_vllm_config.additional_config = {
-            "enable_reduce_sample": True
-        }
+        mock_vllm_config.additional_config = {"enable_reduce_sample": True}
 
         with patch(
             "vllm.config.get_current_vllm_config",

@@ -271,7 +271,7 @@ def sample_recovered_tokens_kernel(
     draft_token_ids_ptr,  # [num_tokens]
     draft_probs_ptr,  # [num_tokens, vocab_size] or None
     target_probs_ptr,  # [num_tokens, vocab_size]
-    target_indices_ptr, # [num_tokens, vocab_size] global vocab indices
+    target_indices_ptr,  # [num_tokens, vocab_size] global vocab indices
     q_ptr,  # [batch_size, vocab_size]
     vocab_size,
     NO_DRAFT_PROBS: tl.constexpr,
@@ -312,9 +312,7 @@ def sample_recovered_tokens_kernel(
             prob = tl.where(is_draft, 0.0, tprob)
         else:
             valid = (gidx >= 0) & (gidx < vocab_size) & mask
-            dprob = tl.load(draft_probs_ptr + token_idx * vocab_size + gidx, mask=valid, other=0.0).to(
-                tl.float32
-            )
+            dprob = tl.load(draft_probs_ptr + token_idx * vocab_size + gidx, mask=valid, other=0.0).to(tl.float32)
             prob = tl.maximum(tprob - dprob, 0.0)
 
         qv = tl.load(q_ptr + req_idx * C + offs, mask=mask, other=1.0).to(tl.float32)

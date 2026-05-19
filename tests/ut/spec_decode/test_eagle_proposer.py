@@ -3474,7 +3474,6 @@ class TestEagleProposerPrepareInputsPadded:
 
 @npu_test(num_npus=1, npu_type="a2")
 class TestEagleProposerSetInputsFirstPass:
-class TestEagleProposerSetInputsFirstPass:
     """Test set_inputs_first_pass for AscendEagleProposer.
 
     This test class covers all branches of set_inputs_first_pass:
@@ -4097,13 +4096,6 @@ class TestEagleProposerSetInputsFirstPass:
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
 
-        assert proposer.net_num_new_slots_per_request == 1
-        assert proposer.needs_extra_input_slots
-        assert out_num_tokens == 7
-
-        assert torch.equal(
-            proposer.input_ids[:out_num_tokens],
-            torch.tensor([10, 11, 100, 0, 20, 21, 200], dtype=torch.int32, device=self.device),
         assert proposer.net_num_new_slots_per_request == 1
         assert proposer.needs_extra_input_slots
         assert out_num_tokens == 7

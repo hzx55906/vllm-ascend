@@ -223,6 +223,7 @@ def test_qwen3_eagle3_pcp2_tp1():
     ) as llm:
         llm.generate(prompts, sampling_params)
 
+
 def test_qwen3_eagle3_reduce_sample():
     """
     Test Qwen3-8B with Eagle3 speculative decoding under PCP + TP1 configuration.

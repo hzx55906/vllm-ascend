@@ -62,6 +62,7 @@ def precompute_and_store_context_kv(
             context_slot_mapping,
         )
 
+
 # TODO(MengqingCao): remove after the upstream community is modified
 def compute_logits(
     self,
@@ -76,6 +77,7 @@ def compute_logits(
     next_token = greedy_sample(logits)
     bias = torch.index_select(self.draft_id_to_target_id, dim=0, index=next_token.view(-1)).view(next_token.shape)
     return next_token + bias
+
 
 def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     tp_group = get_tp_group()
@@ -92,6 +94,7 @@ def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     global_max_rank = gathered_logits.argmax(dim=-1)  # [B]
     target_argmax = gathered_global_idx.gather(dim=-1, index=global_max_rank.unsqueeze(-1)).squeeze(-1)  # [B]
     return target_argmax
+
 
 DFlashQwen3Model.precompute_and_store_context_kv = precompute_and_store_context_kv
 DFlashQwen3ForCausalLM.compute_logits = compute_logits

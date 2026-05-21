@@ -950,13 +950,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
-        logits = self.model.compute_logits(sample_hidden_states)
+        draft_token_ids = self.model.compute_logits(sample_hidden_states)
 
-        if lmhead_tp_enable() and num_indices < logits.shape[0]:
-            logits = logits[:num_indices]
+        if lmhead_tp_enable() and num_indices < draft_token_ids.shape[0]:
+            draft_token_ids = draft_token_ids[:num_indices]
             token_indices_to_sample = token_indices_to_sample[:num_indices]
-
-        draft_token_ids = logits.argmax(dim=-1)
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
@@ -964,7 +962,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.pcp_size * self.dcp_size > 1 and is_prefill:
-            draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_list = []
             for _ in range(self.num_speculative_tokens):
                 draft_token_ids_list.append(draft_token_ids)
@@ -1083,15 +1080,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 )
 
             sample_hidden_states = last_hidden_states[token_indices_to_sample]
-            logits = self.model.compute_logits(sample_hidden_states)
+            draft_token_ids = self.model.compute_logits(sample_hidden_states)
 
-            if lmhead_tp_enable() and num_indices < logits.shape[0]:
-                logits = logits[:num_indices]
+            if lmhead_tp_enable() and num_indices < draft_token_ids.shape[0]:
+                draft_token_ids = draft_token_ids[:num_indices]
                 token_indices_to_sample = token_indices_to_sample[:num_indices]
 
             # TODO(wenlong): get more than one token for tree attention
             hidden_states = hidden_states[:batch_size]
-            draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_tensor[draft_step + 1] = draft_token_ids
 
         # [batch_size, num_speculative_tokens]

@@ -1,17 +1,3 @@
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# This file is a part of the vllm-ascend project.
-#
 from unittest.mock import patch
 
 import torch
@@ -82,20 +68,22 @@ class TestAscendRejectionSampler(TestBase):
     @patch("torch.full", new=mock_pin_memory(torch.full))
     @patch("torch.tensor", new=mock_pin_memory(torch.tensor))
     def test_rejection_random_sample_pytorch(self):
-        """Test random rejection sampling: accept based on uniform probability"""
+        """Test random rejection sampling with compressed logits: accept based on uniform probability"""
         batch_size = 2
         max_spec_len = 3
         output_token_ids = torch.full((batch_size, max_spec_len + 1), PLACEHOLDER_TOKEN_ID)
 
         cu_num_draft_tokens = torch.tensor([2, 1])
         draft_token_ids = torch.tensor([1, 0, 2])
+        # draft_probs uses global vocab size (5)
         draft_probs = torch.tensor(
             [
-                [0.0, 0.6, 0.0, 0.4],  # vocab_size=4
-                [0.1, 0.2, 0.3, 0.4],
-                [0.5, 0.5, 0.0, 0.0],
+                [0.0, 0.6, 0.0, 0.4, 0.0],
+                [0.1, 0.2, 0.3, 0.4, 0.0],
+                [0.5, 0.5, 0.0, 0.0, 0.0],
             ]
         )
+        # target_probs uses compressed vocab size (4)
         target_probs = torch.tensor(
             [
                 [0.0, 0.8, 0.0, 0.2],
@@ -103,11 +91,19 @@ class TestAscendRejectionSampler(TestBase):
                 [0.9, 0.1, 0.0, 0.0],
             ]
         )
+        # target_indices maps compressed positions to global vocab indices
+        target_indices = torch.tensor(
+            [
+                [0, 1, 2, 3],
+                [0, 1, 2, 3],
+                [0, 1, 2, 3],
+            ]
+        )
         bonus_token_ids = torch.tensor([[100], [200]])
         recovered_token_ids = torch.tensor([1, 2, 3])
         uniform_probs = torch.tensor([0.7, 0.6, 0.5])
         is_greedy = torch.tensor([False, False])
-        vocab_size = 4
+        vocab_size = 4  # compressed_vocab_size
 
         rejection_random_sample_pytorch(
             output_token_ids,
@@ -122,6 +118,7 @@ class TestAscendRejectionSampler(TestBase):
             max_spec_len,
             vocab_size,
             IS_NGRAM=False,
+            target_indices=target_indices,
         )
 
         assert output_token_ids[0, 0].item() == 1
@@ -192,7 +189,7 @@ class TestAscendRejectionSampler(TestBase):
     @patch("torch.full", new=mock_pin_memory(torch.full))
     @patch("torch.tensor", new=mock_pin_memory(torch.tensor))
     def test_sample_recovered_tokens_pytorch_ngram(self):
-        """Test recovered token sampling under n-gram mode"""
+        """Test recovered token sampling under n-gram mode with compressed logits"""
         output_token_ids = torch.empty(2, dtype=torch.int32)
         cu_num_draft_tokens = torch.tensor([1, 2])
         draft_token_ids = torch.tensor([1, 2])
@@ -210,6 +207,12 @@ class TestAscendRejectionSampler(TestBase):
             ]
         )
         vocab_size = 3
+        target_indices = torch.tensor(
+            [
+                [0, 1, 2],
+                [0, 1, 2],
+            ]
+        )
 
         sample_recovered_tokens_pytorch(
             output_token_ids,
@@ -220,6 +223,7 @@ class TestAscendRejectionSampler(TestBase):
             q,
             vocab_size,
             IS_NGRAM=True,
+            target_indices=target_indices,
         )
 
         assert output_token_ids[0].item() == 0
@@ -230,7 +234,7 @@ class TestAscendRejectionSampler(TestBase):
     @patch("torch.full", new=mock_pin_memory(torch.full))
     @patch("torch.tensor", new=mock_pin_memory(torch.tensor))
     def test_rejection_random_sample_block_verify_pytorch(self):
-        """Test random rejection sampling for block verify: accept based on uniform probability"""
+        """Test random rejection sampling for block verify with compressed logits"""
         batch_size = 2
         max_spec_len = 3
         output_token_ids = torch.full((batch_size, max_spec_len + 1), PLACEHOLDER_TOKEN_ID)
@@ -249,6 +253,13 @@ class TestAscendRejectionSampler(TestBase):
                 [0.0, 0.8, 0.0, 0.2],
                 [0.2, 0.1, 0.3, 0.4],
                 [0.9, 0.1, 0.0, 0.0],
+            ]
+        )
+        target_indices = torch.tensor(
+            [
+                [0, 1, 2, 3],
+                [0, 1, 2, 3],
+                [0, 1, 2, 3],
             ]
         )
         bonus_token_ids = torch.tensor([[100], [200]])
@@ -270,6 +281,7 @@ class TestAscendRejectionSampler(TestBase):
             max_spec_len,
             vocab_size,
             IS_NGRAM=False,
+            target_indices=target_indices,
         )
 
         assert output_token_ids[0, 0].item() == 1
@@ -281,7 +293,7 @@ class TestAscendRejectionSampler(TestBase):
     @patch("torch.full", new=mock_pin_memory(torch.full))
     @patch("torch.tensor", new=mock_pin_memory(torch.tensor))
     def test_sample_recovered_tokens_blockwise_pytorch_ngram(self):
-        """Test recovered token sampling for blockwise speculative decoding with n-gram."""
+        """Test recovered token sampling for blockwise speculative decoding with n-gram and compressed logits."""
         output_token_ids = torch.empty(2, dtype=torch.int32)
         cu_num_draft_tokens = torch.tensor([1, 2])
         draft_token_ids = torch.tensor([1, 2])
@@ -299,6 +311,12 @@ class TestAscendRejectionSampler(TestBase):
             ]
         )
         vocab_size = 3
+        target_indices = torch.tensor(
+            [
+                [0, 1, 2],
+                [0, 1, 2],
+            ]
+        )
 
         sample_recovered_tokens_blockwise_pytorch(
             output_token_ids,
@@ -309,6 +327,7 @@ class TestAscendRejectionSampler(TestBase):
             q,
             vocab_size,
             IS_NGRAM=True,
+            target_indices=target_indices,
         )
 
         assert output_token_ids[0].item() == 0
@@ -319,7 +338,7 @@ class TestAscendRejectionSampler(TestBase):
     @patch("torch.full", new=mock_pin_memory(torch.full))
     @patch("torch.tensor", new=mock_pin_memory(torch.tensor))
     def test_sample_recovered_tokens_blockwise_pytorch(self):
-        """Test recovered token sampling for blockwise speculative decoding."""
+        """Test recovered token sampling for blockwise speculative decoding with compressed logits."""
         output_token_ids = torch.empty(2, dtype=torch.int32)
         cu_num_draft_tokens = torch.tensor([1, 2])
         draft_token_ids = torch.tensor([0, 1])
@@ -342,6 +361,12 @@ class TestAscendRejectionSampler(TestBase):
             ]
         )
         vocab_size = 3
+        target_indices = torch.tensor(
+            [
+                [0, 1, 2],
+                [0, 1, 2],
+            ]
+        )
 
         sample_recovered_tokens_blockwise_pytorch(
             output_token_ids,
@@ -352,6 +377,7 @@ class TestAscendRejectionSampler(TestBase):
             q,
             vocab_size,
             IS_NGRAM=False,
+            target_indices=target_indices,
         )
         assert output_token_ids[0].item() == 0
         assert output_token_ids[1].item() == 0

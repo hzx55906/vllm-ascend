@@ -2191,6 +2191,7 @@ class MockDraftModel:
         token_ids = sample_hidden_states[:, 0].to(torch.long)
         logits = torch.full((sample_hidden_states.shape[0], self.vocab_size), -1000.0)
         logits[torch.arange(sample_hidden_states.shape[0]), token_ids] = 1000.0
+        logits = logits.argmax(dim=-1)
         return logits
 
     def embed_input_ids(self, input_ids):

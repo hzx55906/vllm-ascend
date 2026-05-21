@@ -1,6 +1,10 @@
 import torch
 import torch.nn.functional as F
-from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
+from vllm.distributed.parallel_state import get_tp_group
+from vllm.model_executor.models.qwen3_dflash import (
+    DFlashQwen3ForCausalLM,
+    DFlashQwen3Model,
+)
 
 
 def precompute_and_store_context_kv(
@@ -59,4 +63,38 @@ def precompute_and_store_context_kv(
         )
 
 
+# TODO(MengqingCao): remove after the upstream community is modified
+def compute_logits(
+    self,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor | None:
+    logits = self.logits_processor(self.lm_head, hidden_states)
+    if self.draft_id_to_target_id is None:
+        logits = logits.contiguous()
+        return greedy_sample(logits)
+
+    logits = logits.contiguous()
+    next_token = greedy_sample(logits)
+    bias = torch.index_select(self.draft_id_to_target_id, dim=0, index=next_token.view(-1)).view(next_token.shape)
+    return next_token + bias
+
+
+def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
+    tp_group = get_tp_group()
+    B, V_local = logits.shape
+    rank = tp_group.rank_in_group
+
+    local_max_logits, local_max_indices = logits.max(dim=-1)
+
+    local_global_idx = local_max_indices + rank * V_local  # [B]
+
+    # [B, world_size]
+    gathered_logits = tp_group.all_gather(local_max_logits.unsqueeze(-1), dim=-1)
+    gathered_global_idx = tp_group.all_gather(local_global_idx.unsqueeze(-1), dim=-1)  # [B, world_size]
+    global_max_rank = gathered_logits.argmax(dim=-1)  # [B]
+    target_argmax = gathered_global_idx.gather(dim=-1, index=global_max_rank.unsqueeze(-1)).squeeze(-1)  # [B]
+    return target_argmax
+
+
 DFlashQwen3Model.precompute_and_store_context_kv = precompute_and_store_context_kv
+DFlashQwen3ForCausalLM.compute_logits = compute_logits

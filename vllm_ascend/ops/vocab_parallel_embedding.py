@@ -265,10 +265,15 @@ class AscendLogitsProcessor(LogitsProcessor):
         gathered_hidden_states = get_lmhead_tp_group().all_gather(hidden_states, dim=0)
         local_logits = lm_head.quant_method.apply(lm_head, gathered_hidden_states, bias=embedding_bias)
         # Gather logits for tensor parallel
-        logits = get_lmhead_tp_group().all_to_all(local_logits)
+        tp_size = get_lmhead_tp_group().world_size
+        rank = get_lmhead_tp_group().rank
+
+        batch_size = local_logits.shape[0] // tp_size
+
+        logits = local_logits[rank * batch_size : (rank + 1) * batch_size]
         # Remove paddings in vocab (if any)
         if logits is not None:
-            logits = logits[..., : self.org_vocab_size]
+            logits = logits[..., : lm_head.num_org_embeddings_per_partition]
         return logits
 
     def _get_logits_normal(
@@ -277,12 +282,12 @@ class AscendLogitsProcessor(LogitsProcessor):
         lm_head: AscendParallelLMHead,
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor | None:
-        local_logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
-        # Gather logits for tensor parallel
-        logits = self._gather_logits(local_logits)
+        logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
+        # Skip gathering logits across TP ranks - reduce sampling handles
+        # distributed vocab by only all-gathering top-k candidates later.
 
         # Remove paddings in vocab (if any)
         if logits is not None:
-            logits = logits[..., : self.org_vocab_size]
+            logits = logits[..., : lm_head.num_org_embeddings_per_partition]
 
         return logits

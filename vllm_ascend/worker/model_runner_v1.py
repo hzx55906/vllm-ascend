@@ -2266,7 +2266,7 @@ class NPUModelRunner(GPUModelRunner):
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[: self.input_batch.num_reqs]
-            if sampling_metadata.top_k is not None:
+            if sampling_metadata.top_k is not None and self.input_batch.top_k_cpu is not None:
                 max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
                 self.sampler.prepare_sampling(max_topk)
             return self.sampler(
@@ -2276,7 +2276,7 @@ class NPUModelRunner(GPUModelRunner):
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
-        if sampling_metadata.top_k is not None:
+        if sampling_metadata.top_k is not None and self.input_batch.top_k_cpu is not None:
             max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
             self.rejection_sampler.prepare_sampling(max_topk)
         sampler_output = self.rejection_sampler(

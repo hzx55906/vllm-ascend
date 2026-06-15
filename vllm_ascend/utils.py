@@ -1667,6 +1667,7 @@ def set_reduce_sample_force_disabled(value: bool) -> bool:
     _reduce_sample_force_disabled = value
     return prev
 
+
 _REDUCE_SAMPLE_CHECK_FIELDS: tuple[tuple[str, object], ...] | None = None
 
 
@@ -1734,6 +1735,6 @@ def _should_disable_reduce_sample(sampling_params_list) -> bool:
             if getattr(params, name) != default_val:
                 print(
                     f"SamplingParams.{name} cannot be used with reduce_sample, {getattr(params, name)} vs {default_val}"
-                )                
+                )
                 return True
     return False

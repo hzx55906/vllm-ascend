@@ -152,7 +152,6 @@ from vllm_ascend.utils import (
     get_ascend_device_type,
     get_c_env,
     get_compressed_pos_and_indices,
-    get_reduce_sample_force_disabled,
     global_stream,
     is_hidden_state_cache_spec,
     kv_cache_spec_uses_sparse_c8,

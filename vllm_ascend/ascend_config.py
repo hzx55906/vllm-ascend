@@ -292,7 +292,9 @@ class AscendConfig:
         self.dp_allreduce_on_npu = additional_config.get("dp_allreduce_on_npu", False)
 
         # Enable optimized reduce sampling scheme
-        self.enable_reduce_sample = additional_config.get("enable_reduce_sample", True)
+        # default to False on 310P to avoid potential aicore exceptions.
+        _reduce_sample_default = not self._is_310p()
+        self.enable_reduce_sample = additional_config.get("enable_reduce_sample", _reduce_sample_default)
 
         self.mix_placement = additional_config.get("mix_placement", False)
         self._check_mix_placement()
@@ -319,6 +321,13 @@ class AscendConfig:
                 "next release."
             )
         return env_value
+
+    @staticmethod
+    def _is_310p() -> bool:
+        """Check if the current device is 310P. Uses lazy import to avoid
+        circular dependency between ascend_config and utils."""
+        from vllm_ascend.utils import is_310p
+        return is_310p()
 
     def _check_mix_placement(self):
         if self.mix_placement:

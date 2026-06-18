@@ -327,6 +327,7 @@ class AscendConfig:
         """Check if the current device is 310P. Uses lazy import to avoid
         circular dependency between ascend_config and utils."""
         from vllm_ascend.utils import is_310p
+
         return is_310p()
 
     def _check_mix_placement(self):

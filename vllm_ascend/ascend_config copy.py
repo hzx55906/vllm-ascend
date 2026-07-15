@@ -176,12 +176,6 @@ class AscendConfig:
             "VLLM_ASCEND_ENABLE_FUSED_MC2",
             ascend_envs.VLLM_ASCEND_ENABLE_FUSED_MC2,
         )
-        self.enable_moe_allreduce = self._get_config_value(
-            additional_config,
-            "enable_moe_allreduce",
-            "VLLM_ASCEND_ENABLE_MOE_ALLREDUCE",
-            ascend_envs.VLLM_ASCEND_ENABLE_MOE_ALLREDUCE,
-        )
         self.enable_mlapo = self._get_config_value(
             additional_config,
             "enable_mlapo",
@@ -665,6 +659,7 @@ class WeightPrefetchConfig:
         },
         "moe": {"gate_up": 0.8},
         "mlp": {"gate_up": 1.0, "down": 1.0},
+        "lm_head": {"weight": 1.0},
     }
 
     def __init__(self, weight_prefetch_config: dict):

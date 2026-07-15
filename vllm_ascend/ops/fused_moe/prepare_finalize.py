@@ -541,3 +541,45 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
             hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
             hidden_states = hidden_states[: self.num_tokens_pcp]
         return hidden_states
+
+
+class PrepareAndFinalizeWithAllReduce(PrepareAndFinalize):
+    """MoE communication strategy using a single AllReduce.
+
+    Only valid when EP=TP (single-node deployment). All TP ranks hold the
+    same hidden_states (guaranteed by the preceding attention layer's o_proj
+    TP AllReduce), so no TP split or AllGather is needed before MoE.
+
+    prepare(): Pass through hidden_states and router_logits unchanged.
+               No TP split, no AllGather, no communication.
+    finalize(): No-op. The actual AllReduce is performed later, on the
+                combined (shared + routed) output, by
+                _maybe_reduce_final_output() in the runner.
+    """
+
+    def prepare(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        enable_shared_expert_dp: bool = False,
+        replace_allreduce: bool = False,
+        quant_type: QuantType = QuantType.NONE,
+    ) -> MoEPrepareOutput:
+        self.num_tokens = hidden_states.shape[0]
+        return MoEPrepareOutput(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            mc2_mask=None,
+            padded_hidden_states_shape=None,
+            pertoken_scale=None,
+        )
+
+    def finalize(
+        self,
+        hidden_states: torch.Tensor,
+        reduce_results: bool,
+        padded_hidden_states_shape: torch.Size | None = None,
+    ) -> torch.Tensor:
+        # No-op: the AllReduce is done later on the combined output
+        # by _maybe_reduce_final_output() in the runner.
+        return hidden_states

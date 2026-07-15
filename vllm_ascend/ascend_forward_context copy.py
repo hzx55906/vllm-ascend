@@ -29,7 +29,6 @@ class MoECommType(Enum):
     MC2 = 1
     ALLTOALL = 2
     FUSED_MC2 = 3
-    ALLREDUCE = 4
 
 
 _MRV2_IN_PROFILE_RUN: ContextVar[bool] = ContextVar("_MRV2_IN_PROFILE_RUN", default=False)
@@ -155,6 +154,7 @@ def set_ascend_forward_context(
 
         forward_context.prefetch_mlp_gate_up_proj = False
         forward_context.prefetch_mlp_down_proj = False
+        forward_context.prefetch_lm_head = False
         forward_context.model_instance = model_instance
         forward_context.is_draft_model = is_draft_model
         forward_context.is_draft_model_prefill = False
@@ -277,21 +277,12 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
 
     if not vllm_config.parallel_config.enable_expert_parallel or get_ep_group().world_size == 1:
         moe_comm_type = MoECommType.ALLGATHER
-    elif (
-        get_ascend_config().enable_moe_allreduce
-        and get_ep_group().world_size == get_tensor_model_parallel_world_size()
-        and not enable_sp(vllm_config)
-        and not get_ascend_config().enable_shared_expert_dp
-    ):
-        # Single-node AllReduce mode: EP=TP, SP disabled, shared_expert_dp disabled.
-        # Replaces MC2 Dispatch/Combine + TP AllGather + TP AllReduce with one AllReduce.
-        moe_comm_type = MoECommType.ALLREDUCE
     elif soc_version in {AscendDeviceType.A2}:
         num_experts = vllm_config.model_config.get_num_experts()
         ep_world_size = (
             vllm_config.parallel_config.world_size_across_dp // vllm_config.parallel_config.pipeline_parallel_size
         )
-        num_experts_per_device = num_experts // ep_world_size  
+        num_experts_per_device = num_experts // ep_world_size
         if num_experts_per_device <= 24 and ep_world_size >= 16 and num_tokens <= mc2_tokens_capacity:
             moe_comm_type = MoECommType.MC2
         else:
@@ -366,6 +357,7 @@ class _ExtraForwardContextProxy:
         "is_draft_model_prefill",
         "prefetch_mlp_gate_up_proj",
         "prefetch_mlp_down_proj",
+        "prefetch_lm_head",
         "model_instance",
         "layer_idx",
         "max_tokens_across_dp",

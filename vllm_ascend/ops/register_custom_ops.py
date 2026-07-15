@@ -124,11 +124,18 @@ def _maybe_pad_and_reduce_fake(x: torch.Tensor, is_ep_comm: bool = False) -> tor
 
 
 def _prefetch_preprocess_impl(weight: torch.Tensor, start_flag: torch.Tensor, max_weight_size: int) -> None:
-    calculation_stream = torch_npu.npu.current_stream()
-    weight_prefetch_stream = prefetch_stream()
-    weight_prefetch_stream.wait_stream(calculation_stream)
-    with npu_stream_switch(weight_prefetch_stream):
+    if torch.npu.is_current_stream_capturing():
+        # During ACL Graph capture (GLOBAL mode), cross-stream synchronization
+        # (wait_stream) and MemCopySync from npu_prefetch on a separate stream
+        # are not permitted. Fall back to issuing npu_prefetch on the current
+        # (capturing) stream so the operation is recorded into the graph.
         maybe_npu_prefetch(inputs=weight, dependency=start_flag, max_size=max_weight_size)
+    else:
+        calculation_stream = torch_npu.npu.current_stream()
+        weight_prefetch_stream = prefetch_stream()
+        weight_prefetch_stream.wait_stream(calculation_stream)
+        with npu_stream_switch(weight_prefetch_stream):
+            maybe_npu_prefetch(inputs=weight, dependency=start_flag, max_size=max_weight_size)
 
 
 def _prefetch_preprocess_impl_fake(weight: torch.Tensor, start_flag: torch.Tensor, max_weight_size: int) -> None:
@@ -136,6 +143,10 @@ def _prefetch_preprocess_impl_fake(weight: torch.Tensor, start_flag: torch.Tenso
 
 
 def _prefetch_postprocess_impl(stop_flag: torch.Tensor) -> None:
+    if torch.npu.is_current_stream_capturing():
+        # During ACL Graph capture, the prefetch was issued on the same
+        # (capturing) stream, so no cross-stream synchronization is needed.
+        return
     calculation_stream = torch_npu.npu.current_stream()
     weight_prefetch_stream = prefetch_stream()
     calculation_stream.wait_stream(weight_prefetch_stream)

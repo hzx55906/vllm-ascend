@@ -53,6 +53,7 @@ _sin_mla: torch.Tensor = None
 _cos_cache: torch.Tensor = None
 _sin_cache: torch.Tensor = None
 _cos_sin_cache: torch.Tensor = None
+_cos_sin_cache_mla: torch.Tensor = None
 _cos: torch.Tensor = None
 _sin: torch.Tensor = None
 _cos_slice: torch.Tensor = None
@@ -89,8 +90,13 @@ def set_cos_and_sin(vllm_config, max_num_reqs, decode_token_per_req, dtype, devi
 def get_cos_and_sin_mla(positions, use_cache=False):
     global _cos_cache
     global _sin_cache
-    cos = _cos_cache[positions].unsqueeze(1).unsqueeze(2)
-    sin = _sin_cache[positions].unsqueeze(1).unsqueeze(2)
+    global _cos_sin_cache_mla
+    cos_sin = torch.index_select(_cos_sin_cache_mla, 0, positions)
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    cos = cos.unsqueeze(1).unsqueeze(2)
+    sin = sin.unsqueeze(1).unsqueeze(2)
+    # cos = _cos_cache[positions].unsqueeze(1).unsqueeze(2)
+    # sin = _sin_cache[positions].unsqueeze(1).unsqueeze(2)
     if not use_cache:
         return cos, sin
     global _cos_mla
@@ -111,19 +117,23 @@ def _record_cos_sin_cache(cos_sin_cache):
 def _record_cos_and_sin_cache(cos_cache, sin_cache):
     global _cos_cache
     global _sin_cache
+    global _cos_sin_cache_mla
     _cos_cache = cos_cache
     _sin_cache = sin_cache
+    _cos_sin_cache_mla = torch.cat([cos_cache, sin_cache], dim=-1)
 
 
 def _record_cos_and_sin_cache_interleaved(cos_sin_cache):
     global _cos_cache
     global _sin_cache
+    global _cos_sin_cache_mla
     if _cos_cache is not None or _sin_cache is not None:
         return
     hidden_dim = cos_sin_cache.shape[-1] // 2
     cos_cache, sin_cache = cos_sin_cache.view(-1, 2, hidden_dim).repeat(1, 1, 2).chunk(2, dim=1)
     _cos_cache = cos_cache.squeeze(1)
     _sin_cache = sin_cache.squeeze(1)
+    _cos_sin_cache_mla = torch.cat([_cos_cache, _sin_cache], dim=-1)
 
 
 def update_cos_sin(positions):

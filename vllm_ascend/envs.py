@@ -92,6 +92,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_NZ": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_NZ", 1)),
     # Whether to anbale dynamic EPLB
     "DYNAMIC_EPLB": lambda: os.getenv("DYNAMIC_EPLB", "false").lower(),
+    # Whether to enable MoE one-shot AllReduce communication mode.
+    # When enabled and EP=TP (single-node), replaces MC2 Dispatch/Combine + TP AllGather
+    # + TP AllReduce with a single AllReduce on the combined (shared + routed) output.
+    # Only valid when EP=TP, SP is disabled, and shared_expert_dp is disabled.
+    "VLLM_ASCEND_ENABLE_MOE_ALLREDUCE": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MOE_ALLREDUCE", "0"))),
     # Whether to enable fused MC2 (`dispatch_gmm_combine_decode` / `dispatch_ffn_combine`).
     # 0, or not set: default ALLTOALL and MC2 will be used.
     # 1: ALLTOALL and MC2 might be replaced by `dispatch_ffn_combine` operator.

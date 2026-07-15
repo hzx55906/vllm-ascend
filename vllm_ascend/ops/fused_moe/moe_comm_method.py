@@ -35,6 +35,7 @@ from vllm_ascend.ops.fused_moe.prepare_finalize import (
     PrepareAndFinalize,
     PrepareAndFinalizeWithAll2All,
     PrepareAndFinalizeWithAllGather,
+    PrepareAndFinalizeWithAllReduce,
     PrepareAndFinalizeWithMC2,
 )
 from vllm_ascend.ops.fused_moe.token_dispatcher import (
@@ -58,6 +59,7 @@ def setup_moe_comm_method(moe_config):
         _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
         _MoECommMethods[MoECommType.MC2] = MC2CommImpl(moe_config)
         _MoECommMethods[MoECommType.FUSED_MC2] = FusedMC2CommImpl(moe_config)
+        _MoECommMethods[MoECommType.ALLREDUCE] = AllReduceCommImpl(moe_config)
     else:
         _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
 
@@ -210,6 +212,36 @@ class AllGatherCommImpl(MoECommMethod):
 
     def _get_prepare_finalize(self):
         return PrepareAndFinalizeWithAllGather(self.moe_config)
+
+
+class AllReduceCommImpl(MoECommMethod):
+    """Single AllReduce MoE communication implementation.
+
+    Only valid when EP=TP (single-node deployment). Uses local-only
+    token dispatch/combine (npu_moe_init_routing + npu_moe_token_unpermute)
+    with a single AllReduce performed on the combined (shared + routed)
+    output after both computations are done.
+
+    Communication flow:
+    1. prepare(): No-op (all TP ranks see same hidden_states from o_proj AllReduce)
+    2. token_dispatch(): Local npu_moe_init_routing (sort by local experts only)
+    3. MLP computation (local experts only)
+    4. token_combine(): Local npu_moe_token_unpermute (unsort + apply weights)
+    5. finalize(): No-op (AllReduce done later on combined output)
+    6. Shared expert: local computation (no separate AllReduce)
+    7. Final AllReduce: on combined (routed + shared) output, done by
+       _maybe_reduce_final_output() in the runner
+    """
+
+    def _get_token_dispatcher(self):
+        return TokenDispatcherWithAllGather(
+            top_k=self.moe_config.experts_per_token,
+            num_experts=self.moe_config.num_experts,
+            num_local_experts=self.moe_config.num_local_experts,
+        )
+
+    def _get_prepare_finalize(self):
+        return PrepareAndFinalizeWithAllReduce(self.moe_config)
 
 
 class MC2CommImpl(MoECommMethod):

@@ -945,3 +945,63 @@ Upstream vLLM's synthetic path draws the per-token uniform numbers with `tl_rand
 - **MRV2** (`vllm_ascend/worker/v2/spec_decode/rejection_sampler_utils.py`, used when the V2 model runner is enabled): the uniform draw is generated **inside** `_probabilistic_rejection_kernel` with `SYNTHETIC_MODE=True`, using a 1-element-block fp32 `tl.rand` clamped to `[2^-31, 1)` — equivalent to upstream's `includes_zero=False` semantics. Both greedy and sampling temperatures are supported, and the first rejected position is followed by a resampled/bonus token from the target distribution, as in `standard` mode.
 
 The configuration interface (`rejection_sample_method`, `synthetic_acceptance_rates`, `synthetic_acceptance_length`) is identical on both paths.
+
+### Probability-Augmented Greedy Acceptance (PAGA) (v2)
+
+Probability-Augmented Greedy Acceptance (PAGA) extends greedy acceptance with
+a probability-ratio acceptance path for requests with temperature greater than
+zero. A draft token matching the target model's argmax is accepted
+unconditionally; other draft tokens can pass the standard probability-ratio
+test. Verification stops at the first rejection and uses the existing
+resampling logic at that position.
+
+PAGA is an experimental, engine-wide opt-in. Enable it with
+`additional_config.rejection_sampler_config.probability_augmented_greedy_acceptance`.
+The value must be a JSON boolean and defaults to `false`.
+
+The configuration key was renamed from `argmax_assisted_acceptance` to
+`probability_augmented_greedy_acceptance`. Update existing launch configurations
+to use the new key; the old key is not an alias. This rename leaves the
+acceptance rule and default behavior unchanged.
+
+> [!WARNING]
+> Enabling this option can change the output distribution for nonzero
+> temperatures. It is not distribution-preserving speculative decoding.
+> Measure quality as well as acceptance length and latency before enabling
+> it for a workload.
+
+The option requires the Ascend v2 runner, speculative decoding, and
+`rejection_sample_method="standard"`. Enabling it with the v1 runner, without
+speculation, with synthetic/block verification, or with Ascend's
+`enable_block_verify` / `enable_entropy_verify` options raises a configuration
+error instead of silently ignoring the setting. It applies to all requests in
+the engine; it is not a `SamplingParams` or HTTP request field.
+
+The implementation reuses the upstream logits-statistics kernel unchanged.
+When enabled, an additional device-side `torch.argmax`
+on the processed target logits supplies the greedy tokens to the Ascend v2
+acceptance kernel. This adds
+a vocabulary reduction but does not draw extra random numbers. With the option
+disabled, no extra argmax is performed and the original
+acceptance expression is used. Temperature-zero requests retain the original greedy verification
+logic regardless of this option. This preserves the current processed-logits
+definition of the greedy token; it does not run a separate sampler with a new
+set of sampling parameters. Device-level equivalence and performance should be
+validated on the deployment hardware.
+
+```shell
+VLLM_USE_V2_MODEL_RUNNER=1 \
+vllm serve path/to/target/model \
+  --speculative-config '{"method": "draft_model", "model": "path/to/draft/model", "num_speculative_tokens": 3, "rejection_sample_method": "standard"}' \
+  --additional-config '{"rejection_sampler_config": {"probability_augmented_greedy_acceptance": true}}'
+```
+
+For offline inference, pass the same dictionary to
+`LLM(..., additional_config={"rejection_sampler_config": {"probability_augmented_greedy_acceptance": True}})`
+with speculative decoding and the v2 runner enabled. Merge this key into any
+existing `--additional-config` dictionary instead of passing the flag twice.
+Omit the key or set it to `false` to disable the policy, then restart the service.
+
+Argmax currently covers all rows (including greedy requests and bonus rows)
+over the effective vocabulary shared with draft logits, when present. It does
+not compact top-k candidates; benchmark the added reduction on your hardware.

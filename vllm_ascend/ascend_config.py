@@ -23,7 +23,7 @@ import os
 from statistics import NormalDist
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import ConfigDict, TypeAdapter, field_validator, model_validator
+from pydantic import ConfigDict, StrictBool, TypeAdapter, field_validator, model_validator
 from pydantic_core import ArgsKwargs
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
@@ -335,13 +335,16 @@ class EplbConfig:
 
 @config
 class RejectionSamplerConfig:
-    """Configuration for Block Verify and Entropy Verify in Rejection Sampler.
+    """Configuration for speculative verification, including PAGA.
 
     Migrated to ``@config`` (pydantic dataclass). Type checks (bool/float) are
     now handled by pydantic field types; range checks moved to an ``after``
     model_validator.
     """
 
+    # Probability-Augmented Greedy Acceptance; engine-wide opt-in.
+    # Reject string and integer coercion for this lossy policy.
+    probability_augmented_greedy_acceptance: StrictBool = False
     enable_block_verify: bool = False
     enable_entropy_verify: bool = False
     posterior_threshold: float = 0.95
@@ -349,6 +352,11 @@ class RejectionSamplerConfig:
 
     @model_validator(mode="after")
     def _validate(self):
+        if self.probability_augmented_greedy_acceptance and (self.enable_block_verify or self.enable_entropy_verify):
+            raise ValueError(
+                "probability_augmented_greedy_acceptance cannot be combined with "
+                "enable_block_verify or enable_entropy_verify."
+            )
         if not (0 < self.posterior_threshold <= 1):
             raise ValueError(
                 f"rejection_sampler_config.posterior_threshold must be in (0, 1], got {self.posterior_threshold}"
@@ -356,6 +364,17 @@ class RejectionSamplerConfig:
         if self.posterior_alpha < 0:
             raise ValueError(f"rejection_sampler_config.posterior_alpha must be >= 0, got {self.posterior_alpha}")
         return self
+
+    def validate_for_vllm_config(self, vllm_config: VllmConfig) -> None:
+        if not self.probability_augmented_greedy_acceptance:
+            return
+        spec_config = vllm_config.speculative_config
+        if spec_config is None:
+            raise ValueError("probability_augmented_greedy_acceptance requires speculative decoding to be configured.")
+        if not vllm_config.use_v2_model_runner:
+            raise ValueError("probability_augmented_greedy_acceptance requires the Ascend v2 model runner.")
+        if spec_config.rejection_sample_method != "standard":
+            raise ValueError("probability_augmented_greedy_acceptance requires rejection_sample_method='standard'.")
 
 
 @config
@@ -680,6 +699,13 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        self.rejection_sampler_config.validate_for_vllm_config(vc)
+        if self.rejection_sampler_config.probability_augmented_greedy_acceptance:
+            logger.warning_once(
+                "Probability-Augmented Greedy Acceptance (PAGA) is enabled for this engine. "
+                "It changes the output distribution for temperature > 0; "
+                "evaluate quality and performance for your workload."
+            )
         engram_config = getattr(vc, "engram_config", None)
         if (
             engram_config is not None

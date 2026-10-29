@@ -26,6 +26,7 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     _compute_local_logits_stats_kernel as _compute_block_stats_kernel,
 )
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ops.triton.v2.spec_decode.resample import resample
 
 
@@ -43,6 +44,8 @@ def _probabilistic_rejection_kernel(
     # [num_logits, V]
     target_logits_ptr,
     target_logits_stride,
+    # [num_logits], only read for PAGA at T>0
+    greedy_token_ids_ptr,
     # [num_logits, num_blocks]
     target_local_argmax_ptr,
     target_local_argmax_stride,
@@ -80,6 +83,7 @@ def _probabilistic_rejection_kernel(
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
     SYNTHETIC_MODE: tl.constexpr,
+    PAGA_ENABLED: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     # Cast to int64 before pointer arithmetic: triton-ascend computes
@@ -196,7 +200,14 @@ def _probabilistic_rejection_kernel(
                 else:
                     # Probability ratio test: p(x) > u * q(x)
                     # Equivalent log form: log_p(x) > log(u) + log_q(x)
-                    accepted &= target_log_prob > tl.log(u) + draft_log_prob
+                    if PAGA_ENABLED:
+                        # PAGA keeps greedy matches and adds probability-ratio acceptance.
+                        target_argmax = tl.load(greedy_token_ids_ptr + logit_idx)
+                        accepted &= (target_log_prob > tl.log(u) + draft_log_prob) | (
+                            target_argmax == draft_sampled
+                        )
+                    else:
+                        accepted &= target_log_prob > tl.log(u) + draft_log_prob
                 # -1 placeholder draft tokens can never be accepted.
                 accepted &= is_valid_draft
                 tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_sampled)
@@ -242,6 +253,12 @@ def rejection_sample(
     num_reqs = cu_num_logits.shape[0] - 1
     num_logits, vocab_size = target_logits.shape
     has_draft_logits = draft_logits is not None
+    sampler_config = get_ascend_config().rejection_sampler_config
+    paga_enabled = sampler_config.probability_augmented_greedy_acceptance
+    if paga_enabled and (use_block_verification or synthetic_conditional_rates is not None):
+        raise ValueError(
+            "probability_augmented_greedy_acceptance requires standard, not block or synthetic, verification."
+        )
 
     if draft_logits is None:
         # When draft_logits is None, create a dummy tensor so that Triton
@@ -252,6 +269,10 @@ def rejection_sample(
         # In some cases (e.g. MiMo v2.5 Pro + DFlash) the target model's
         # vocab size is larger than the draft's due to padding.
         vocab_size = min(vocab_size, draft_logits.size(-1))
+
+    # Match the effective vocabulary of the probability-ratio test, including
+    # targets padded beyond the draft vocabulary. No extra RNG or host sync.
+    greedy_token_ids = torch.argmax(target_logits[:, :vocab_size], dim=-1) if paga_enabled else None
 
     # Compute the block-level logits stats, such as target argmax
     # (for greedy requests), and target max + softmax exponential
@@ -306,6 +327,7 @@ def rejection_sample(
         draft_rejected_logsumexp,
         target_logits,
         target_logits.stride(0),
+        greedy_token_ids,
         target_local_argmax,
         target_local_argmax.stride(0),
         target_local_max,
@@ -330,6 +352,7 @@ def rejection_sample(
         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
         HAS_DRAFT_LOGITS=has_draft_logits,
         SYNTHETIC_MODE=synthetic_conditional_rates is not None,
+        PAGA_ENABLED=paga_enabled,
         num_warps=1,
     )
 

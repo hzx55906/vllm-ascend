@@ -1,7 +1,12 @@
 import gc
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
+
+import vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils as rejection_sampler_v2
+from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import rejection_sample as rejection_sample_v2
 
 from vllm_ascend.ops.triton.reject_sample import (
     cal_grid_and_block_size,
@@ -29,6 +34,141 @@ KERNEL_TEST_ITERS = 1
 def setup_device_properties():
     init_device_properties_triton()
     yield
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("has_draft_logits", [False, True])
+@pytest.mark.parametrize("temperature_values", [(1.0, 1.0), (0.0, 0.0), (0.0, 1.0), (1.0, 0.0)])
+@pytest.mark.parametrize(
+    ("probability_augmented_greedy_acceptance", "expected_num_sampled"),
+    [(False, [1, 1]), (True, [3, 1])],
+)
+def test_v2_paga_switch(
+    monkeypatch, probability_augmented_greedy_acceptance, expected_num_sampled, temperature_values, has_draft_logits
+):
+    sampler_config = SimpleNamespace(probability_augmented_greedy_acceptance=probability_augmented_greedy_acceptance)
+    monkeypatch.setattr(
+        rejection_sampler_v2, "get_ascend_config", lambda: SimpleNamespace(rejection_sampler_config=sampler_config)
+    )
+    device = "npu"
+    batch_size = 2
+    num_speculative_steps = 2
+    logits_per_request = num_speculative_steps + 1
+    vocab_size = 9000
+
+    target_logits = torch.zeros(
+        (batch_size * logits_per_request, vocab_size),
+        dtype=torch.float32,
+        device=device,
+    )
+    greedy_draft_tokens = torch.tensor([8500, 8501], device=device)
+    target_logits[0, 8500] = 1e-3
+    target_logits[1, 8501] = 1e-3
+
+    target_logits[3, 10] = -100.0
+    target_logits[3, 20] = 1.0
+    target_logits[4, 11] = -100.0
+    target_logits[4, 21] = 1.0
+
+    draft_sampled = torch.tensor(
+        [0, 8500, 8501, 0, 10, 11],
+        dtype=torch.int64,
+        device=device,
+    )
+    cu_num_logits = torch.arange(
+        0,
+        batch_size * logits_per_request + 1,
+        logits_per_request,
+        dtype=torch.int32,
+        device=device,
+    )
+    idx_mapping = torch.arange(batch_size, dtype=torch.int32, device=device)
+    expanded_idx_mapping = idx_mapping.repeat_interleave(logits_per_request)
+    expanded_local_pos = torch.arange(
+        logits_per_request, dtype=torch.int32, device=device
+    ).repeat(batch_size)
+    pos = torch.arange(
+        batch_size * logits_per_request, dtype=torch.int32, device=device
+    )
+    temperature = torch.tensor(temperature_values, dtype=torch.float32, device=device)
+    seed = torch.tensor([17, 23], dtype=torch.int64, device=device)
+    draft_logits = None
+    if has_draft_logits:
+        # Concentrate q on the proposed tokens, as in the one-hot case, while
+        # exercising the actual draft-logit statistics and residual path.
+        draft_logits = torch.zeros((batch_size, num_speculative_steps, vocab_size), device=device)
+        draft_logits[0, 0, 8500] = 100.0
+        draft_logits[0, 1, 8501] = 100.0
+        draft_logits[1, 0, 10] = 100.0
+        draft_logits[1, 1, 11] = 100.0
+
+    inputs = dict(
+        target_logits=target_logits,
+        draft_logits=draft_logits,
+        draft_sampled=draft_sampled,
+        cu_num_logits=cu_num_logits,
+        pos=pos,
+        idx_mapping=idx_mapping,
+        expanded_idx_mapping=expanded_idx_mapping,
+        expanded_local_pos=expanded_local_pos,
+        temperature=temperature,
+        seed=seed,
+        num_speculative_steps=num_speculative_steps,
+    )
+
+    with patch.object(torch, "argmax", wraps=torch.argmax) as argmax:
+        sampled, num_sampled = rejection_sample_v2(**inputs)
+    assert argmax.call_count == int(probability_augmented_greedy_acceptance)
+    if temperature_values[0] == 0.0:
+        expected_num_sampled = [3, 1]
+    assert num_sampled.tolist() == expected_num_sampled
+    if probability_augmented_greedy_acceptance or temperature_values[0] == 0.0:
+        assert torch.equal(sampled[0, :2], greedy_draft_tokens)
+
+    # Even in a mixed-temperature batch the switch must not change greedy
+    # requests, including the rejected token and the all-accepted bonus token.
+    sampler_config.probability_augmented_greedy_acceptance = not probability_augmented_greedy_acceptance
+    other_sampled, other_num_sampled = rejection_sample_v2(**inputs)
+    for req_idx, temp in enumerate(temperature_values):
+        if temp == 0.0:
+            count = num_sampled[req_idx].item()
+            assert other_num_sampled[req_idx].item() == count
+            assert torch.equal(sampled[req_idx, :count], other_sampled[req_idx, :count])
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("vocab_size", [256, 9000])
+@pytest.mark.parametrize("has_draft_logits", [False, True])
+def test_v2_paga_greedy_ties(monkeypatch, vocab_size, has_draft_logits):
+    sampler_config = SimpleNamespace(probability_augmented_greedy_acceptance=False)
+    monkeypatch.setattr(
+        rejection_sampler_v2, "get_ascend_config", lambda: SimpleNamespace(rejection_sampler_config=sampler_config)
+    )
+    # Equal maxima in different vocabulary blocks (when vocab_size > 8192).
+    target_logits = torch.zeros((3, vocab_size), device="npu", dtype=torch.float32)
+    target_logits[:, 10] = 1.0
+    target_logits[:, vocab_size - 1] = 1.0
+    inputs = dict(
+        target_logits=target_logits,
+        draft_logits=torch.zeros((1, 2, vocab_size), device="npu") if has_draft_logits else None,
+        draft_sampled=torch.tensor([0, 10, 10], device="npu", dtype=torch.int64),
+        cu_num_logits=torch.tensor([0, 3], device="npu", dtype=torch.int32),
+        pos=torch.arange(3, device="npu", dtype=torch.int32),
+        idx_mapping=torch.tensor([0], device="npu", dtype=torch.int32),
+        expanded_idx_mapping=torch.zeros(3, device="npu", dtype=torch.int32),
+        expanded_local_pos=torch.arange(3, device="npu", dtype=torch.int32),
+        temperature=torch.zeros(1, device="npu"),
+        seed=torch.tensor([17], device="npu", dtype=torch.int64),
+        num_speculative_steps=2,
+    )
+    results = []
+    for enabled in (False, True):
+        sampler_config.probability_augmented_greedy_acceptance = enabled
+        results.append(rejection_sample_v2(**inputs))
+    assert results[0][1].tolist() == [3]
+    assert torch.equal(results[0][1], results[1][1])
+    assert torch.equal(results[0][0], results[1][0])
+    assert results[1][0].tolist() == [[10, 10, 10]]
 
 
 @torch.inference_mode()

@@ -3,11 +3,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import gc
+from types import SimpleNamespace
 
 import pytest
 import torch
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 
+import vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils as rejection_sampler_v2
 from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import rejection_sample
 
 VOCAB_SIZE = 4096
@@ -15,6 +17,18 @@ VOCAB_SIZE = 4096
 pytest.importorskip("triton")
 if not (hasattr(torch, "npu") and torch.npu.is_available()):
     pytest.skip("NPU required for MRV2 rejection sampler tests", allow_module_level=True)
+
+
+@pytest.fixture(autouse=True)
+def default_acceptance_config(monkeypatch):
+    # Operator tests run without initializing a full model engine.
+    monkeypatch.setattr(
+        rejection_sampler_v2,
+        "get_ascend_config",
+        lambda: SimpleNamespace(
+            rejection_sampler_config=SimpleNamespace(probability_augmented_greedy_acceptance=False)
+        ),
+    )
 
 
 def _build_rejection_sample_inputs(
@@ -270,3 +284,33 @@ def test_placeholder_draft_tokens_are_rejected(has_draft_logits: bool):
 
     gc.collect()
     torch.npu.empty_cache()
+
+
+@pytest.mark.parametrize("placeholder", [False, True])
+@torch.inference_mode()
+def test_v2_argmax_padded_vocabulary_and_placeholder(monkeypatch, placeholder):
+    monkeypatch.setattr(
+        rejection_sampler_v2,
+        "get_ascend_config",
+        lambda: SimpleNamespace(
+            rejection_sampler_config=SimpleNamespace(probability_augmented_greedy_acceptance=True)
+        ),
+    )
+    # Tied maxima across vocabulary blocks must choose the smallest index.
+    target = torch.zeros(9000, device="npu")
+    target[0] = target[-1] = 0.001
+    draft = torch.zeros_like(target)
+    draft[0] = 100.0
+    inputs = _build_rejection_sample_inputs(target, draft, 2, 1.0, 1)
+    inputs["draft_sampled"][1:] = 0
+    if placeholder:
+        # Clamping -1 to 0 for a safe load must not turn it into an acceptance.
+        inputs["draft_sampled"][1] = -1
+    # Padding is outside the effective vocabulary, even if it has larger logits.
+    inputs["target_logits"] = torch.cat(
+        [inputs["target_logits"], torch.full((3, 2), 100.0, device="npu")], dim=1
+    )
+    sampled, num_sampled = rejection_sample(**inputs, num_speculative_steps=2)
+    assert num_sampled.tolist() == ([1] if placeholder else [3])
+    if not placeholder:
+        assert sampled[0, :2].tolist() == [0, 0]

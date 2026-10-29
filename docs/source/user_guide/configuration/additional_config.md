@@ -80,7 +80,7 @@ The following table lists additional configuration options available in vLLM Asc
 | `enable_flashcomm1`                 | bool | `False` | Whether to enable SP MoE. See [Sequence Parallelism](../feature_guide/sequence_parallelism.md). |
 | `enable_pcp_o_proj_weight_sharding` | bool | `True` | Whether PCP shards O-projection weights across the PCP group. This option controls SFA-PCP `o_proj` and DSA-PCP two-stage O-projection (`wo_a`/`wo_b`). If the weight method or PCP partition does not support sharding, the option is disabled with a warning. Set it to `false` at server startup to disable sharding. Other attention backends do not use this option. |
 | `enable_pcp_embedding_lmhead_weight_sharding` | bool | `True` | Whether PCP shards embedding and LM Head weights across PCP ranks inside each TP shard. This option is enabled by default, takes effect when PCP size is greater than 1, and is incompatible with batch-sharded sampling (`enable_batch_sharded_sampling`) and fine-grained TP for these modules. |
-| `rejection_sampler_config`          | dict | `{}`    | Configuration options for rejection sampler (block verify and entropy verify). |
+| `rejection_sampler_config`          | dict | `{}`    | Configuration options for rejection sampler (block verify, entropy verify, and v2 PAGA). |
 | `dynamic_spec_config`               | dict | `{}`    | Configuration options for Dynamic Speculative Decoding. See [Dynamic Speculative Decoding](../feature_guide/speculative_decoding.md#dynamic-speculative-decoding). |
 | `multistream_dsv4_dsa_overlap`      | bool | `True`  | Whether to enable dsa multi-stream overlap for DeepSeek V4.  |
 | `rl_config`                        | dict | `{}`    | One-click RL mode configuration. See <a href="#rl_config">rl_config</a> for all fields, the two deployment modes, usage examples, and the migration guide. |
@@ -226,10 +226,17 @@ settings; enabling both selects the combined DyntraLB recompute scheduler.
 
 **rejection_sampler_config**
 
+`probability_augmented_greedy_acceptance` is a strict boolean, default `false`, enabling
+engine-wide lossy acceptance for the v2 standard verifier. See
+[Probability-Augmented Greedy Acceptance (PAGA)](../feature_guide/speculative_decoding.md#probability-augmented-greedy-acceptance-paga-v2)
+for configuration, semantics, and limitations.
+
+
 > **Note**: Both block verify and entropy verify improve speculative decoding performance (higher acceptance rate, lower latency) at the cost of reduced sampling precision. A larger `posterior_alpha` makes the adjustment more aggressive — it further lowers the acceptance threshold for high-entropy tokens, improving throughput but degrading output quality. Users should tune these parameters based on their specific model weights and application scenario to find the right trade-off between performance and precision.
 
 | Name | Type | Default | Description |
 | ---- | ---- | ------- | ----------- |
+| `probability_augmented_greedy_acceptance` | bool | `False` | Opt in to PAGA on the v2 standard verifier. Requires an actual JSON boolean. |
 | `enable_block_verify`   | bool  | `False` | Whether to enable block verify mode. Block verify evaluates all draft tokens as a block using cumulative probability products, which can improve acceptance rate. |
 | `enable_entropy_verify` | bool  | `False` | Whether to enable entropy verify mode. Entropy verify adjusts the acceptance threshold based on the entropy of the target distribution — higher entropy (uncertain) tokens get a lower threshold (easier to accept), while lower entropy (confident) tokens get a stricter threshold. |
 | `posterior_threshold`   | float | `0.95`  | Upper bound for the entropy-adjusted acceptance threshold. Must be in (0, 1]. The effective threshold is `min(exp(-entropy * posterior_alpha), posterior_threshold)`. |

@@ -1891,6 +1891,14 @@ class TestTopLevelSwitchTypeValidation(TestBase):
         self.assertEqual(config.rejection_sampler_config.posterior_threshold, 0.8)
 
     @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_paga_requires_speculation_in_factory(self, mock_fix):
+        vc = VllmConfig()
+        vc.additional_config = {"rejection_sampler_config": {"probability_augmented_greedy_acceptance": True}}
+        with self.assertRaisesRegex(ValueError, "requires speculative decoding"):
+            init_ascend_config(vc)
+
+    @_clean_up
     @patch("vllm_ascend.utils.model_uses_sfa_sparse", return_value=False)
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_enable_kv_nz_uses_vllm_config_preconditions(self, mock_fix, mock_sparse):
